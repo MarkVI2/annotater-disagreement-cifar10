@@ -91,7 +91,7 @@ class SoftLabelPredictor(nn.Module):
         logits = self.head(features)
         return F.softmax(logits, dim=1)
     
-LOCAL_WEIGHTS_DEFAULT = os.path.join('models', 'weights', 'resnet18.pt')
+DEFAULT_WEIGHTS_PATH = os.path.join('models', 'weights', 'resnet18.pt')
 
 def load_local_cifar10_weights(weights_path, map_location='cpu'):
     if not os.path.isfile(weights_path):
@@ -104,10 +104,17 @@ def build_soft_label_model(head_type='linear', pretrained=True, weights_path=Non
     backbone = CIFAR10ResNet18Backbone()
 
     if pretrained:
-        path = weights_path or LOCAL_WEIGHTS_DEFAULT
-        try:
-            state = load_local_cifar10_weights(path)
-            print(f"Loaded backbone weights form {path}")
-        except FileNotFoundError:
-            if download_fallback:
-                print(f"Local weights not found at {path}, downloading from kaggle")
+        path = weights_path or DEFAULT_WEIGHTS_PATH
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"Pretrained weights not found at {path}. "
+                f"Please place resnet18.pt in models/weights/ or provide a weights_path."
+            )
+        state = torch.load(path, map_location='cpu')
+        msg = backbone.load_state_dict(state, strict=False)
+        print(f"Loaded backbone weights from {path}")
+        print(f"  Missing keys (expected): {msg.missing_keys}")
+        print(f"  Unexpected keys (were ignored): {msg.unexpected_keys}")
+
+    model = SoftLabelPredictor(backbone, num_classes=10, head_type=head_type)
+    return model
