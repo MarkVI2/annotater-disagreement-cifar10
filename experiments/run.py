@@ -23,11 +23,13 @@ weight_decay = 1e-4
 loss_beta = 0.5
 loss_epsilon = 0.1
 
+INIT_TEMP = 2.0
+
 all_configs = []
 for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, use_temperature):
     exp_name = f'{loss}_{head}_pt_{pt}'
     if temp:
-        exp_name += '_temp'
+        exp_name += f'_temp{INIT_TEMP}'
     save_dir = PROJECT_ROOT / 'outputs' / 'checkpoints' / exp_name
     cmd = (
         f"python -m training.train "
@@ -43,7 +45,7 @@ for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, u
         f"--loss_epsilon {loss_epsilon} "
     )
     if temp:
-        cmd += " --use_temperature --init_temp 2.0"
+        cmd += f" --use_temperature --init_temp {INIT_TEMP}"
     all_configs.append((exp_name, cmd, save_dir))
 
 

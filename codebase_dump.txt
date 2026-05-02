@@ -1,11 +1,66 @@
 ===== ./visualisations/grad_cam_plots.py =====
 
 ===== ./visualisations/training_curves.py =====
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
 
+def plot_training_curves(log_dir, exp_name):
+    """
+    Reads the metrics CSV from log_dir/{exp_name}_metrics.csv and saves
+    training/validation loss curves + validation KL (or primary loss) curve.
+    """
+    csv_path = os.path.join(log_dir, f'{exp_name}_metrics.csv')
+    if not os.path.exists(csv_path):
+        print(f"No log file found at {csv_path}, skipping training curves.")
+        return
+
+    df = pd.read_csv(csv_path)
+    epochs = df['epoch']
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    fig.suptitle(f'Training Curves: {exp_name}')
+
+    # Loss curves
+    ax1.plot(epochs, df['train_loss'], label='Train Loss', color='#2196F3', linewidth=2)
+    ax1.plot(epochs, df['val_loss'], label='Val Loss', color='#FF5722', linestyle='--', linewidth=2)
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Train vs Validation Loss')
+    ax1.legend()
+    ax1.grid(alpha=0.3)
+
+    # Validation loss (which for KL is KL divergence)
+    ax2.plot(epochs, df['val_loss'], color='#4CAF50', linewidth=2)
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Validation Loss')
+    ax2.set_title('Validation Loss over Epochs')
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs('outputs/plots', exist_ok=True)
+    save_path = os.path.join('outputs/plots', f'{exp_name}_training_curves.png')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Training curves saved to {save_path}")
 ===== ./visualisations/data_plots.py =====
 
 ===== ./visualisations/model_diagram.py =====
+import torch
+from models.cifar_resnet import build_soft_label_model
+from torchviz import make_dot
 
+# Generate and save a diagram of the model
+model = build_soft_label_model(head_type='linear', pretrained_type='random')
+x = torch.randn(1, 3, 32, 32)
+dot = make_dot(model(x), params=dict(model.named_parameters()))
+dot.render('model_diagram', format='png', cleanup=True)
+print("Model diagram saved as model_diagram.png")
+
+# Parameter count
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total parameters: {total_params:,}")
+print(f"Trainable parameters: {trainable_params:,}")
 ===== ./visualisations/eval_plots.py =====
 
 ===== ./losses/custom_losses.py =====
@@ -1271,9 +1326,6 @@ if __name__ == "__main__":
     dataset, splits, loaders, stats = main()
 
 ===== ./experiments/run.py =====
-"""
-Parallel experiments runner: distributes independent configs across available GPUs.
-"""
 import subprocess
 import csv
 import os
@@ -1287,10 +1339,11 @@ sys.path.insert(0, str(project_root))
 
 PROJECT_ROOT = project_root
 
-# ---- Experiment grid ----
+# Experiment grid: losses, heads, pretrained_type (ablation A/B/C)
 losses = ['kl', 'js', 'custom_composite', 'emd']
 heads = ['linear', 'mlp']
-pretrain_options = [True]
+pretrained_types = ['random', 'cifar10', 'imagenet']
+use_temperature = [False, True]
 epochs = 60
 batch_size = 128
 lr = 1e-3
@@ -1298,16 +1351,17 @@ weight_decay = 1e-4
 loss_beta = 0.5
 loss_epsilon = 0.1
 
-# ---- Prepare a list of configs ----
 all_configs = []
-for loss, head, pretrained in itertools.product(losses, heads, pretrain_options):
-    exp_name = f'{loss}_{head}'
+for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, use_temperature):
+    exp_name = f'{loss}_{head}_pt_{pt}'
+    if temp:
+        exp_name += '_temp'
     save_dir = PROJECT_ROOT / 'outputs' / 'checkpoints' / exp_name
-    pretrain_flag = '--pretrained' if pretrained else ''
     cmd = (
         f"python -m training.train "
         f"--loss {loss} "
         f"--head {head} "
+        f"--pretrained_type {pt} "
         f"--epochs {epochs} "
         f"--batch_size {batch_size} "
         f"--lr {lr} "
@@ -1315,15 +1369,13 @@ for loss, head, pretrained in itertools.product(losses, heads, pretrain_options)
         f"--save_dir {save_dir} "
         f"--loss_beta {loss_beta} "
         f"--loss_epsilon {loss_epsilon} "
-        f"{pretrain_flag}"
     )
+    if temp:
+        cmd += " --use_temperature --init_temp 2.0"
     all_configs.append((exp_name, cmd, save_dir))
 
 
 def run_one(gpu_id, configs_for_gpu):
-    """
-    Set CUDA_VISIBLE_DEVICES = gpu_id, then sequentially run all assigned configs.
-    """
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
@@ -1331,50 +1383,60 @@ def run_one(gpu_id, configs_for_gpu):
         print(f"[GPU {gpu_id}] Running: {cmd}")
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
         if result.returncode != 0:
-            print(f"Error on GPU {gpu_id}: {result.stderr}")
-            # Still record a failure value
-        # Read best val loss from log
-        log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
+            print(f"[GPU {gpu_id}] ERROR: Training failed for {exp_name}")
+            print("STDOUT:\n", result.stdout)
+            print("STDERR:\n", result.stderr)
+        else:
+            # Even if returncode 0, check log file
+            log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
+            if not log_csv.exists():
+                print(f"[GPU {gpu_id}] WARNING: log file not found for {exp_name} (stdout/stderr below)")
+                print("STDOUT:\n", result.stdout)
+                print("STDERR:\n", result.stderr)
+
+        # Read best validation loss from log (if exists)
         try:
-            with open(log_csv, 'r') as mf:
-                reader = csv.DictReader(mf)
+            with open(log_csv, 'r') as f:
+                reader = csv.DictReader(f)
                 val_losses = [float(row['val_loss']) for row in reader if 'val_loss' in row]
                 best_val = min(val_losses) if val_losses else 999.0
         except Exception as e:
-            print(f"Could not read log for {exp_name}: {e}")
             best_val = 999.0
+            print(f"[GPU {gpu_id}] Could not read log for {exp_name}: {e}")
+
         print(f"[GPU {gpu_id}] {exp_name} best val loss = {best_val:.4f}")
-        # We'll collect results later globally
 
 
 def main():
-    # Split configs between the two GPUs
     gpu_count = 2
     config_chunks = [[] for _ in range(gpu_count)]
     for i, cfg in enumerate(all_configs):
         config_chunks[i % gpu_count].append(cfg)
 
-    # Run in parallel
     with Pool(processes=gpu_count) as pool:
         pool.starmap(run_one, [(gpu_id, config_chunks[gpu_id]) for gpu_id in range(gpu_count)])
 
-    # After all finished, write the summary CSV
+    # Write summary CSV
     results_file = PROJECT_ROOT / 'outputs' / 'ablation_results.csv'
     os.makedirs(results_file.parent, exist_ok=True)
     with open(results_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['loss', 'head', 'pretrained', 'best_val_loss', 'save_dir'])
+        writer.writerow(['exp_name', 'loss', 'head', 'pretrained_type', 'temperature', 'best_val_loss', 'save_dir'])
         for exp_name, cmd, save_dir in all_configs:
-            loss, head = exp_name.split('_', 1)
             log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
+            best_val = 999.0
             try:
-                with open(log_csv, 'r') as mf:
-                    reader = csv.DictReader(mf)
+                with open(log_csv, 'r') as f:
+                    reader = csv.DictReader(f)
                     val_losses = [float(row['val_loss']) for row in reader if 'val_loss' in row]
                     best_val = min(val_losses) if val_losses else 999.0
-            except Exception:
-                best_val = 999.0
-            writer.writerow([loss, head, True, best_val, save_dir])
+            except:
+                pass
+            loss, head = exp_name.split('_')[0], exp_name.split('_')[1]
+            # simple parse to get pretrained_type
+            pt = exp_name.split('_')[3] if len(exp_name.split('_')) > 3 else 'unknown'
+            temp = '_temp' in exp_name
+            writer.writerow([exp_name, loss, head, pt, temp, best_val, str(save_dir)])
     print(f"All experiments finished. Summary written to {results_file}")
 
 
@@ -1518,7 +1580,6 @@ class MetricsLogger:
         self.csv_file.close()
         np.save(self.npy_path, self.metrics)
 ===== ./training/train.py =====
-# training/train.py
 import argparse
 import os
 import time
@@ -1528,6 +1589,8 @@ from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import tqdm
+import json
+import numpy as np
 
 from data.pipeline import load_full_dataset, create_splits, create_dataloaders, get_transforms
 from training.config import (
@@ -1538,7 +1601,7 @@ from training.metrics_logger import MetricsLogger
 from models.cifar_resnet import build_soft_label_model
 from utils.device import get_device, get_autocast_context
 from losses import get_loss_function
-import json
+
 
 def train_one_epoch(model, loader, optimizer, device, scaler, autocast_ctx, loss_fn):
     model.train()
@@ -1548,7 +1611,7 @@ def train_one_epoch(model, loader, optimizer, device, scaler, autocast_ctx, loss
         soft_targets = soft_targets.to(device, non_blocking=True)
 
         with autocast_ctx:
-            pred_probs = model(images)     # already softmaxed
+            pred_probs = model(images)
             loss = loss_fn(pred_probs, soft_targets)
 
         optimizer.zero_grad(set_to_none=True)
@@ -1563,6 +1626,7 @@ def train_one_epoch(model, loader, optimizer, device, scaler, autocast_ctx, loss
         running_loss += loss.item() * images.size(0)
     return running_loss / len(loader.dataset)
 
+
 def validate(model, loader, device, loss_fn):
     model.eval()
     running_loss = 0.0
@@ -1575,6 +1639,7 @@ def validate(model, loader, device, loss_fn):
             running_loss += loss.item() * images.size(0)
     return running_loss / len(loader.dataset)
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--head', type=str, default='linear', choices=['linear', 'mlp'])
@@ -1583,64 +1648,75 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--save_dir', type=str, default=CHECKPOINTS_DIR)
-    parser.add_argument('--pretrained', action='store_true', default=True)
+    parser.add_argument('--pretrained_type', type=str, default='cifar10',
+                        choices=['random', 'cifar10', 'imagenet'])
     parser.add_argument('--no_amp', action='store_true')
-    parser.add_argument('--loss', type=str, default='kl', choices=['kl', 'js', 'emd', 'custom_composite'])
-    parser.add_argument('--loss_beta', type=float, default=0.5, help='Weight for entropy penalty in custom composite loss')
-    parser.add_argument('--loss_epsilon', type=float, default=0.1, help='Epsilon for EMD loss')
+    parser.add_argument('--loss', type=str, default='kl',
+                        choices=['kl', 'js', 'emd', 'custom_composite'])
+    parser.add_argument('--loss_beta', type=float, default=0.5,
+                        help='Weight for entropy penalty in custom composite loss')
+    parser.add_argument('--loss_epsilon', type=float, default=0.1,
+                        help='Epsilon for EMD loss')
+    parser.add_argument('--use_temperature', action='store_true',
+                        help='Use learnable temperature scaling head')
+    parser.add_argument('--init_temp', type=float, default=2.0,
+                        help='Initial temperature value')
+    parser.add_argument('--patience', type=int, default=15,
+                        help='Early stopping patience')
     args = parser.parse_args()
 
     device = get_device()
     print(f"Using device: {device}")
 
-    # ---- Data pipeline ----
-    # Use your teammate's pipeline directly
+    # Data pipeline
     dataset = load_full_dataset(DATA_DIR, CIFAR10H_PROBS_FILE)
     splits = create_splits(dataset, TRAIN_RATIO, VAL_RATIO, FIXED_SEED)
-
-    # Transforms
     transforms_dict = {
         'train': get_transforms(is_train=True),
         'val': get_transforms(is_train=False),
         'test': get_transforms(is_train=False),
     }
-
     loaders = create_dataloaders(splits, args.batch_size, NUM_WORKERS, transforms_dict)
     train_loader = loaders['train']
     val_loader = loaders['val']
 
-    # ---- Model ----
-    model = build_soft_label_model(head_type=args.head, pretrained=args.pretrained)
+    # Model (NO torch.compile – it breaks with learnable temperature)
+    model = build_soft_label_model(
+        head_type=args.head,
+        pretrained_type=args.pretrained_type,
+        use_temperature=args.use_temperature,
+        init_temp=args.init_temp
+    )
     model = model.to(device)
-    model = torch.compile(model, mode='reduce-overhead')
 
-    # ---- Loss function ----
+    # Loss
     loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
     print(f"Using loss: {args.loss}")
 
-    # ---- Optimizer & Scheduler ----
+    # Optimizer & scheduler
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # ---- Mixed precision ----
+    # Mixed precision
     use_amp = not args.no_amp and device.type in ('cuda', 'mps')
     scaler = torch.cuda.amp.GradScaler() if (use_amp and device.type == 'cuda') else None
     autocast_ctx = get_autocast_context(device) if use_amp else torch.no_grad()
 
     os.makedirs(args.save_dir, exist_ok=True)
-    best_val_loss = float('inf')
+    os.makedirs(LOGS_DIR, exist_ok=True)
 
-    exp_name = f'{args.loss}_{args.head}'
+    pretrain_tag = f"pt_{args.pretrained_type}"
+    temp_tag = f"_temp{args.init_temp}" if args.use_temperature else ""
+    exp_name = f'{args.loss}_{args.head}_{pretrain_tag}{temp_tag}'
     logger = MetricsLogger(LOGS_DIR, filename_prefix=exp_name)
 
-    # Save hyperparameters
-    os.makedirs(args.save_dir, exist_ok=True)
     hyperparams = vars(args)
-    with open(os.path.join(args.save_dir, 'hyperparameters.json'), 'w') as f:
+    with open(os.path.join(args.save_dir, f'{exp_name}_hyperparameters.json'), 'w') as f:
         json.dump(hyperparams, f, indent=2)
 
-    # Pass epsilon to loss if using EMD
-    loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
+    # Early stopping setup
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
 
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
@@ -1650,27 +1726,43 @@ def main():
 
         epoch_time = time.time() - start_time
         print(f"Epoch {epoch:03d} | Train {args.loss}: {train_loss:.4f} | Val {args.loss}: {val_loss:.4f} | Time: {epoch_time:.1f}s")
-        
+
         logger.log(epoch, {'train_loss': train_loss, 'val_loss': val_loss})
 
-        # Save checkpoint
         ckpt = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
         }
-        torch.save(ckpt, os.path.join(args.save_dir, 'latest.pth'))
+        torch.save(ckpt, os.path.join(args.save_dir, f'{exp_name}_latest.pth'))
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(ckpt, os.path.join(args.save_dir, 'best.pth'))
+            torch.save(ckpt, os.path.join(args.save_dir, f'{exp_name}_best.pth'))
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= args.patience:
+            print(f"Early stopping triggered after {epoch} epochs (no improvement in {args.patience} epochs).")
+            break
 
     logger.close()
     print(f"Training finished. Best val {args.loss}: {best_val_loss:.4f}")
 
+    # Generate training curves after training
+    try:
+        from visualisations.training_curves import plot_training_curves
+        plot_training_curves(LOGS_DIR, exp_name)
+    except Exception as e:
+        print(f"Could not generate training curve plot: {e}")
+
+
 if __name__ == '__main__':
     main()
-===== ./run_ce_check.py =====
+===== ./tests/test_losses.py =====
+
+===== ./tests/run_ce_check.py =====
 import torch
 from data.pipeline import load_full_dataset, create_splits, create_dataloaders, get_transforms
 from training.config import FIXED_SEED, DATA_DIR, CIFAR10H_PROBS_FILE, BATCH_SIZE, TRAIN_RATIO, VAL_RATIO
@@ -1700,185 +1792,7 @@ with torch.no_grad():
         total_ce += ce.item()
 print(f"Cross-entropy (nats): {total_ce/len(loaders['val']):.4f}")
 
-===== ./tests/test_losses.py =====
-
-===== ./tests/test_models.py =====
-
-===== ./tests/test_data.py =====
-
-===== ./utils/device.py =====
-import torch
-
-def get_device():
-    """
-    Returns the best available device:
-    - CUDA  (NVIDIA GPU) 
-    - MPS   (Apple Silicon GPU)
-    - CPU   (fallback)
-    """
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print(f"Using CUDA — {torch.cuda.get_device_name(0)}")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using MPS — Apple Silicon GPU")
-    else:
-        device = torch.device("cpu")
-        print("Using CPU — no GPU found")
-    return device
-
-
-def get_autocast_context(device: torch.device):
-    """
-    Returns the appropriate autocast context for mixed precision.
-    Used during training only — not needed for eval.
-    """
-    if device.type == "cuda":
-        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
-    elif device.type == "mps":
-        return torch.amp.autocast(device_type="mps", dtype=torch.float16)
-    else:
-        return torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
-
-
-def move_batch_to_device(images, soft_labels, hard_labels, device: torch.device):
-    """
-    Moves a full batch tuple to the target device cleanly.
-    Use this in your eval loop instead of calling .to(device) everywhere.
-    """
-    return (
-        images.to(device, non_blocking=True),
-        soft_labels.to(device, non_blocking=True),
-        hard_labels.to(device, non_blocking=True),
-    )
-===== ./models/__init__.py =====
-
-===== ./models/weight_loading.py =====
-
-===== ./models/cifar_resnet.py =====
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.hub import download_url_to_file
-import os
-
-class CIFAR10ResNet18Backbone(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.in_planes = 64 # number of input channels
-
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.layer1 = self._make_layer(64,2,stride=1)
-        self.layer2 = self._make_layer(128,2,stride=1)
-        self.layer3 = self._make_layer(256,2,stride=1)
-        self.layer4 = self._make_layer(512,2,stride=1)
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu') # He initialization
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1) # init weights to 1
-                nn.init.constant_(m.bias, 0) # init bias to 0
-
-        for m in self.modules():
-            if isinstance(m, BasicBlock):
-                nn.init.constant_(m.bn2.weight, 0) # init tensor to a specific constant value
-    
-    def _make_layer(self, planes, num_blocks, stride):
-        strides = [stride] + [1] * (num_blocks - 1)
-        layers = []
-        for stride in strides:
-            layers.append(BasicBlock(self.in_planes, planes, stride))
-            self.in_planes = planes * BasicBlock.expansion
-        return nn.Sequential(*layers)
-    
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = self.avgpool(out)
-        out = torch.flatten(out, 1)
-        return out
-
-class BasicBlock(nn.Module):
-    expansion = 1
-    def __init__(self, in_planes, planes, stride=1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-
-        self.shortcut = nn.Sequential() # skip connection
-        if stride != 1 or in_planes != self.expansion * planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion * planes)
-            )
-        
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
-    
-class SoftLabelPredictor(nn.Module):
-    def __init__(self, backbone, num_classes=10, head_type='Linear'):
-        super().__init__()
-        self.backbone = backbone
-        self.backbone_out = 512
-
-        if head_type == 'linear':
-            self.head = nn.Linear(self.backbone_out, num_classes)
-        elif head_type == 'mlp':
-            self.head = nn.Sequential(
-                nn.Linear(self.backbone_out, 256),
-                nn.ReLU(inplace=True),
-                nn.Linear(256, num_classes)
-            )
-        else:
-            raise ValueError(f"head_type must be 'linear' or 'mlp', got {head_type}")
-    
-    def forward(self, x):
-        features = self.backbone(x)
-        logits = self.head(features)
-        return F.softmax(logits, dim=1)
-    
-DEFAULT_WEIGHTS_PATH = os.path.join('models', 'weights', 'resnet18.pt')
-
-def load_local_cifar10_weights(weights_path, map_location='cpu'):
-    if not os.path.isfile(weights_path):
-        raise FileNotFoundError(f"Weights file not found at {weights_path}. "
-            "Please place the .pth from the Google Drive zip into that location.")
-    state = torch.load(weights_path, map_location=map_location)
-    return state
-
-def build_soft_label_model(head_type='linear', pretrained=True, weights_path=None, download_fallback=False):
-    backbone = CIFAR10ResNet18Backbone()
-
-    if pretrained:
-        path = weights_path or DEFAULT_WEIGHTS_PATH
-        if not os.path.isfile(path):
-            raise FileNotFoundError(
-                f"Pretrained weights not found at {path}. "
-                f"Please place resnet18.pt in models/weights/ or provide a weights_path."
-            )
-        state = torch.load(path, map_location='cpu')
-        msg = backbone.load_state_dict(state, strict=False)
-        print(f"Loaded backbone weights from {path}")
-        print(f"  Missing keys (expected): {msg.missing_keys}")
-        print(f"  Unexpected keys (were ignored): {msg.unexpected_keys}")
-
-    model = SoftLabelPredictor(backbone, num_classes=10, head_type=head_type)
-    return model
-===== ./models/heads.py =====
-
-===== ./verify_pipeline.py =====
+===== ./tests/verify_pipeline.py =====
 """
 Minimal verification that data pipeline works.
 Runs in < 30 seconds.
@@ -1942,29 +1856,673 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
+===== ./tests/test_models.py =====
+
+===== ./tests/test_data.py =====
+
+===== ./utils/device.py =====
+import torch
+
+def get_device():
+    """
+    Returns the best available device:
+    - CUDA  (NVIDIA GPU) 
+    - MPS   (Apple Silicon GPU)
+    - CPU   (fallback)
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using CUDA — {torch.cuda.get_device_name(0)}")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using MPS — Apple Silicon GPU")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU — no GPU found")
+    return device
+
+
+def get_autocast_context(device: torch.device):
+    """
+    Returns the appropriate autocast context for mixed precision.
+    Used during training only — not needed for eval.
+    """
+    if device.type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+    elif device.type == "mps":
+        return torch.amp.autocast(device_type="mps", dtype=torch.float16)
+    else:
+        return torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
+
+
+def move_batch_to_device(images, soft_labels, hard_labels, device: torch.device):
+    """
+    Moves a full batch tuple to the target device cleanly.
+    Use this in your eval loop instead of calling .to(device) everywhere.
+    """
+    return (
+        images.to(device, non_blocking=True),
+        soft_labels.to(device, non_blocking=True),
+        hard_labels.to(device, non_blocking=True),
+    )
+===== ./models/__init__.py =====
+
+===== ./models/weight_loading.py =====
+
+===== ./models/cifar_resnet.py =====
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import os
+from torchvision.models.resnet import resnet18 as torchvision_resnet18
+
+class BasicBlock(nn.Module):
+    expansion = 1
+    def __init__(self, in_planes, planes, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+class CIFAR10ResNet18Backbone(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.in_planes = 64
+
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.layer1 = self._make_layer(64, 2, stride=1)
+        self.layer2 = self._make_layer(128, 2, stride=1)
+        self.layer3 = self._make_layer(256, 2, stride=1)
+        self.layer4 = self._make_layer(512, 2, stride=1)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        for m in self.modules():
+            if isinstance(m, BasicBlock):
+                nn.init.constant_(m.bn2.weight, 0)
+
+    def _make_layer(self, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(BasicBlock(self.in_planes, planes, stride))
+            self.in_planes = planes * BasicBlock.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = self.avgpool(out)
+        out = torch.flatten(out, 1)
+        return out
+
+class SoftLabelPredictor(nn.Module):
+    def __init__(self, backbone, num_classes=10, head_type='linear', use_temperature=False, init_temp=2.0):
+        super().__init__()
+        self.backbone = backbone
+        self.backbone_out = 512
+        self.use_temperature = use_temperature
+        self.head_type = head_type
+
+        if head_type == 'linear':
+            self.head = nn.Linear(self.backbone_out, num_classes)
+        elif head_type == 'mlp':
+            self.head = nn.Sequential(
+                nn.Linear(self.backbone_out, 256),
+                nn.ReLU(inplace=True),
+                nn.Linear(256, num_classes)
+            )
+        else:
+            raise ValueError(f"head_type must be 'linear' or 'mlp', got {head_type}")
+
+        if use_temperature:
+            self.temperature = nn.Parameter(torch.tensor(init_temp))
+        else:
+            self.temperature = None
+
+    def forward(self, x):
+        features = self.backbone(x)
+        logits = self.head(features)
+        if self.use_temperature:
+            logits = logits / self.temperature
+        return F.softmax(logits, dim=1)
+
+DEFAULT_WEIGHTS_PATH = os.path.join('models', 'weights', 'resnet18.pt')
+
+def load_cifar10_pretrained(backbone, weights_path):
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"Pretrained weights not found at {weights_path}.")
+    state = torch.load(weights_path, map_location='cpu')
+    msg = backbone.load_state_dict(state, strict=False)
+    print(f"Loaded CIFAR-10 backbone weights from {weights_path}")
+    print(f"  Missing keys (expected): {msg.missing_keys}")
+    print(f"  Unexpected keys: {msg.unexpected_keys}")
+    return backbone
+
+def load_imagenet_pretrained(backbone):
+    # Load torchvision ResNet‑18 pretrained on ImageNet
+    pretrained_model = torchvision_resnet18(pretrained=True)
+    target_state = backbone.state_dict()
+    pretrained_state = pretrained_model.state_dict()
+
+    # Keys that can be directly copied (everything except conv1)
+    for k in target_state:
+        if k == 'conv1.weight':
+            # Adapt 7x7 -> 3x3: average the 7x7 kernel to a 3x3 kernel (a simple approach)
+            # or just leave our conv1 random. We'll leave it random and only copy the rest.
+            continue
+        if k in pretrained_state and target_state[k].shape == pretrained_state[k].shape:
+            target_state[k] = pretrained_state[k]
+    backbone.load_state_dict(target_state, strict=False)
+    print("Loaded ImageNet pretrained backbone (except conv1).")
+    return backbone
+
+def build_soft_label_model(head_type='linear', pretrained_type='random',
+                           weights_path=None, use_temperature=False, init_temp=2.0):
+    """
+    pretrained_type: 'random', 'cifar10', 'imagenet'
+    """
+    backbone = CIFAR10ResNet18Backbone()
+
+    if pretrained_type == 'cifar10':
+        path = weights_path or DEFAULT_WEIGHTS_PATH
+        load_cifar10_pretrained(backbone, path)
+    elif pretrained_type == 'imagenet':
+        load_imagenet_pretrained(backbone)
+    elif pretrained_type == 'random':
+        pass  # already random
+    else:
+        raise ValueError(f"Unknown pretrained_type: {pretrained_type}")
+
+    model = SoftLabelPredictor(backbone, num_classes=10, head_type=head_type,
+                               use_temperature=use_temperature, init_temp=init_temp)
+    return model
+===== ./models/heads.py =====
+
+===== ./docs/overview.md =====
+# Predicting Human Annotator Disagreement: The Project Overview
+
+This is a machine learning project pretending to solve human annotator
+disagreement. It takes CIFAR-10H soft labels—where humans couldn't agree on what
+a blurry 32x32 pixel block is—and trains a ResNet-18 to emit the same uncertain
+garbage. The pipeline pushes images through a standard backbone, slaps on a
+linear or MLP head, and minimizes divergences (KL, JS, Earth Mover's) between
+the model's confusion and human confusion.
+
+It builds models, evaluates them, runs ablations, and leaves an embarrassing
+graveyard of empty test files. It mostly works, but you clearly got lazy halfway
+through building the directory structure.
+
+---
+
+## Subsystems (Directories)
+
+**`analysis/`** Contains scripts to calculate entropy on distributions and spit
+out a few static plots.
+
+**`data/`** Ingests CIFAR-10H data, ruins it with random crops, and spits out
+stratified validation splits. It is the only sane and fully implemented part of
+the codebase.
+
+**`evaluation/`** Computes divergence metrics and draws plots to justify your
+existence. It loads checkpoints, generates `[N, 10]` predictions, and correlates
+model entropy with human entropy.
+
+**`experiments/`** A glorified bash script wrapper masquerading as an experiment
+manager. Stores YAML configs to run different loss ablations.
+
+**`explainability/`** Contains Grad-CAM scripts. It is completely empty because
+nobody actually understands what these networks learn anyway.
+
+**`losses/`** Mathematical punishment for bad predictions. It contains KL, JS,
+custom composites, and Sinkhorn distance functions to force the model to mirror
+human confusion.
+
+**`models/`** The PyTorch plumbing. A hacked-up ResNet-18 that dumps `[B, 512]`
+features into linear or MLP heads to yield `[B, 10]` probabilities.
+
+**`notebooks/`** Jupyter notebooks for data exploration. Standard scratchpad
+garbage you forgot to delete.
+
+**`outputs/`** Where your models, CSV metrics, and matplotlib figures go to die.
+
+**`tests/`** A barren wasteland of empty Python files. You wrote zero tests.
+Predictable.
+
+**`training/`** The standard PyTorch boilerplate loop. It shoves batches through
+models, scales gradients for mixed precision, and saves best checkpoints.
+
+**`utils/`** Device selection boilerplate because nobody can remember how to
+check for Apple Silicon (`mps`) natively.
+
+**`visualisations/`** A collection of empty files. You planned to write modular
+plotting code, but clearly got tired and stuffed it into `evaluation/` instead.
+
+---
+
+## File Docstrings
+
+### Root Files
+
+**`main.py`**
+
+- **Summary**: The entry point that does literally nothing.
+- **Details**: The file is completely empty. You have a main file with no code.
+  Delete it or write something.
+
+**`main_data.py`**
+
+- **Summary**: Orchestrator script for the complete data pipeline.
+- **Details**: Runs 6 sequential stages: seed, load, sanity checks, statistics,
+  splits, and dataloaders. It handles no training, purely data plumbing.
+  - `main()` -> `tuple[CIFAR10HWrapper, dict, dict, dict]` (Returns dataset,
+    splits_dict, loaders_dict, stats_dict).
+
+**`abalation.py`**
+
+- **Summary**: Reads CSV logs and dumps ablation study results.
+- **Details**: Parses `outputs/logs/{exp}_metrics.csv` for every experiment
+  flavor (KL, JS, composite, EMD with linear/MLP heads) and dumps a single
+  summary file to `outputs/ablation_results.csv`. Spells "ablation" wrong in the
+  file name. Fix that.
+
+**`codebase_dump.txt`**
+
+- **Summary**: A massive text file containing all your code dumped in one place.
+- **Details**: Probably generated by some LLM tool. Do not check this into
+  version control.
+
+**`README.md`** & **`requirements.txt`**
+
+- **Summary**: Project docs and pip dependencies.
+- **Details**: Tells people how to run the mess and what packages they need to
+  install.
+
+---
+
+### `data/`
+
+**`data/dataset.py`**
+
+- **Summary**: CIFAR-10H dataset wrapper pairing images with soft label
+  distributions.
+- **Details**: Loads torchvision CIFAR-10 and binds it to CIFAR-10H probability
+  numpy arrays. Enforces that rows sum to 1.0.
+  - `__init__(root: str, soft_labels_path: str, train: bool, transform: Optional)`
+  - `__getitem__(idx: int)` -> `tuple[PIL.Image, Tensor[10], int]`
+  - `get_entropy(idx: int)` -> `float` (range `[0, 3.32]`)
+  - `get_majority_label(idx: int)` -> `int`
+  - `get_all_entropies()` -> `np.ndarray[N]`
+
+**`data/pipeline.py`**
+
+- **Summary**: The core transform and batching factory.
+- **Details**: Handles seeds, creates transforms, splits subsets, and wraps
+  dataloaders. Hardcodes CIFAR-10 normalization values because everyone does.
+  - `set_seed(seed: int)` -> `None`
+  - `get_transforms(is_train: bool)` -> `transforms.Compose`
+  - `load_full_dataset(data_dir: str, soft_labels_path: str)` ->
+    `CIFAR10HWrapper`
+  - `create_splits(dataset: CIFAR10HWrapper, train_ratio: float, val_ratio: float, seed: int)`
+    -> `dict`
+  - `create_dataloaders(splits_dict: dict, batch_size: int, num_workers: int, transforms_dict: Optional[dict])`
+    -> `dict`
+  - `run_sanity_checks(dataset: CIFAR10HWrapper)` -> `bool`
+
+**`data/statistics.py`**
+
+- **Summary**: Math functions to tell you how confused the humans were.
+- **Details**: Calculates Shannon entropy, class averages, and majority
+  agreements.
+  - `compute_entropies(soft_labels_numpy: np.ndarray[N, 10])` -> `np.ndarray[N]`
+  - `compute_class_average_entropy(entropies: np.ndarray[N], hard_labels: np.ndarray[N], num_classes: int)`
+    -> `dict`
+  - `compute_annotator_confusion_matrix(soft_labels: np.ndarray[N, 10], hard_labels: np.ndarray[N], num_classes: int)`
+    -> `np.ndarray[10, 10]`
+  - `compute_majority_agreement(soft_labels: np.ndarray[N, 10], hard_labels: np.ndarray[N])`
+    -> `float`
+  - `identify_extreme_examples(entropies: np.ndarray[N], n: int)` -> `dict`
+  - `compute_all_statistics(dataset: CIFAR10HWrapper)` -> `dict`
+
+**`data/visualization.py`**
+
+- **Summary**: Generates the four required data analysis plots.
+- **Details**: Dumps out histograms and confusing matrix pngs.
+  - `plot_entropy_histogram(entropies: np.ndarray[N], save_path: str)` -> `None`
+  - `plot_class_entropy_bar(class_entropy_dict: dict, class_names: list, save_path: str)`
+    -> `None`
+  - `plot_annotator_confusion_matrix(confusion_matrix: np.ndarray[10, 10], class_names: list, save_path: str)`
+    -> `None`
+  - `plot_extreme_examples(dataset: CIFAR10HWrapper, extreme_indices_dict: dict, class_names: list, save_path: str)`
+    -> `None`
+
+**`data/utils.py`**
+
+- **Summary**: Empty utility file.
+- **Details**: Does nothing. Stop creating files you don't need.
+
+**`data/__init__.py`**
+
+- **Summary**: Module exports for data package.
+- **Details**: Just a standard `__all__` list exposing pipeline and stats
+  functions.
+
+---
+
+### `models/`
+
+**`models/cifar_resnet.py`**
+
+- **Summary**: ResNet-18 stripped down to fit tiny 32x32 images.
+- **Details**: Rips out the standard ResNet stem and replaces it with a `k=3`
+  convolution so CIFAR images don't collapse to 1x1 pixels instantly. Pushes the
+  `[B, 512]` features through a Linear or MLP head.
+  - `CIFAR10ResNet18Backbone.forward(x: Tensor[B, 3, 32, 32])` ->
+    `Tensor[B, 512]`
+  - `SoftLabelPredictor.__init__(backbone: CIFAR10ResNet18Backbone, head_type: str)`
+  - `SoftLabelPredictor.forward(x: Tensor[B, 3, 32, 32])` -> `Tensor[B, 10]`
+    (softmaxed probabilities).
+
+**`models/heads.py`**, **`models/weight_loading.py`**, **`models/__init__.py`**
+
+- **Summary**: Empty ghosts of a refactoring attempt.
+- **Details**: Completely empty files. You dumped the head logic straight into
+  `cifar_resnet.py` and left these here to rot.
+
+---
+
+### `losses/`
+
+**`losses/kl_divergence.py`**
+
+- **Summary**: PyTorch's `F.kl_div` wrapper for soft targets.
+- **Details**:
+  - `kl_divergence(pred_probs: Tensor[B, 10], target_probs: Tensor[B, 10])` ->
+    `Tensor[]` (scalar loss).
+
+**`losses/js_divergence.py`**
+
+- **Summary**: Jensen-Shannon divergence loss.
+- **Details**: Symmetric version of KL divergence. Averages per-sample KL to a
+  mean distribution `M`.
+  - `js_divergence(pred_probs: Tensor[B, 10], target_probs: Tensor[B, 10])` ->
+    `Tensor[]` (scalar loss).
+
+**`losses/custom_losses.py`**
+
+- **Summary**: Composite loss function penalizing both distribution and entropy
+  divergence.
+- **Details**: Blends KL divergence and absolute entropy error using a `beta`
+  factor.
+  - `custom_composite_loss(pred_probs: Tensor[B, 10], target_probs: Tensor[B, 10], beta: float)`
+    -> `Tensor[]` (scalar loss).
+
+**`losses/emd_loss.py`**
+
+- **Summary**: Differentiable Earth Mover's Distance using Sinkhorn iterations.
+- **Details**: Solves optimal transport using a pre-defined 10x10 semantic cost
+  matrix. Loops matrix multiplications `max_iter` times. It runs slowly, but it
+  works.
+  - `sinkhorn_loss(pred_probs: Tensor[B, 10], target_probs: Tensor[B, 10], cost_matrix: Tensor[10, 10], epsilon: float, max_iter: int)`
+    -> `Tensor[]` (scalar loss).
+
+**`losses/utils.py`**
+
+- **Summary**: Another empty utils file.
+- **Details**: See my previous rants about making files for no reason.
+
+**`losses/__init__.py`**
+
+- **Summary**: Loss function factory.
+- **Details**: Uses
+  `get_loss_function(loss_name: str, beta: float, epsilon: float)` -> `Callable`
+  to bind parameters and return the requested loss.
+
+---
+
+### `training/`
+
+**`training/config.py`**
+
+- **Summary**: Central configuration vault.
+- **Details**: Hardcodes epochs, batch sizes, seed values, and file paths.
+  Throws assertions if you feed it garbage on import.
+
+**`training/train.py`**
+
+- **Summary**: The core training script. It churns data and moves weights.
+- **Details**: Sets up the model, wraps it in `torch.compile()`, handles CLI
+  arguments via `argparse`, and runs the standard train/val loop with mixed
+  precision `autocast`.
+  - `train_one_epoch(model: nn.Module, loader: DataLoader, optimizer: Optimizer, device: torch.device, scaler: GradScaler, autocast_ctx, loss_fn: Callable)`
+    -> `float`
+  - `validate(model: nn.Module, loader: DataLoader, device: torch.device, loss_fn: Callable)`
+    -> `float`
+  - `main()` handles the outer epoch loop and checkpoints.
+
+**`training/metrics_logger.py`**
+
+- **Summary**: Logs metrics to CSV and Numpy arrays.
+- **Details**: Keeps track of `train_loss` and `val_loss` by appending rows to a
+  CSV.
+  - `MetricsLogger.log(epoch: int, metrics_dict: dict)` -> `None`.
+  - `MetricsLogger.close()` -> `None`.
+
+**`training/__init__.py`**
+
+- **Summary**: Empty init file.
+- **Details**: Zero lines.
+
+---
+
+### `evaluation/`
+
+**`evaluation/metrics.py`**
+
+- **Summary**: Big block of pure eval math.
+- **Details**: Computes JSD, KL, Cosine Similarity, and Entropy rank
+  correlations. The `run_all_metrics` dumps them all into a single dict.
+  - `compute_entropy(probs: Tensor[B, 10])` -> `Tensor[B]`
+  - `compute_kl(p: Tensor[B, 10], q: Tensor[B, 10])` -> `float`
+  - `compute_entropy_correlations(true_p: Tensor[N, 10], pred_q: Tensor[N, 10])`
+    -> `tuple[float, float]`
+  - `compute_precision_at_k(true_p: Tensor[N, 10], pred_q: Tensor[N, 10], k: int)`
+    -> `float`
+  - `run_all_metrics(true_p: Tensor[N, 10], pred_q: Tensor[N, 10])` -> `dict`
+
+**`evaluation/eval.py`**
+
+- **Summary**: Inference script that loads checkpoints and dumps plots.
+- **Details**: Loads all 8 models defined in `CHECKPOINTS`, shoves 2,000 test
+  images through them, extracts predictions globally, calculates metrics, and
+  triggers drawing plots.
+  - `load_model(checkpoint_path: str, head_type: str, device: torch.device)` ->
+    `SoftLabelPredictor`
+  - `run_inference(model: SoftLabelPredictor, test_loader: DataLoader, device: torch.device)`
+    -> `tuple[Tensor[N, 10], Tensor[N, 10], Tensor[N], Tensor[N, 3, 32, 32]]`
+    (pred_q, true_p, hard_labels, images).
+
+**`evaluation/robustness.py`**
+
+- **Summary**: Checks if the model falls apart on OOD data or sub-sampled
+  annotators.
+- **Details**: Adds Gaussian noise to images to see if the entropy correlates.
+  Drops annotators randomly to simulate sparsity.
+  - `annotator_subsampling_check(raw_counts: np.ndarray[N, 10], pred_q: Tensor[N, 10], subsample_sizes: list)`
+    -> `dict`
+  - `ood_corruption_check(model: nn.Module, test_images: Tensor[N, 3, 32, 32], severities: list)`
+    -> `dict`
+  - `per_class_kl(true_p: Tensor[N, 10], pred_q: Tensor[N, 10], hard_labels: Tensor[N])`
+    -> `dict`
+
+**`evaluation/visualize.py`**
+
+- **Summary**: Creates all evaluation plots.
+- **Details**: qualitative grids, scatter plots, and metric comparisons. Takes
+  raw tensors and saves matplotlib pngs.
+  - `plot_entropy_scatter(true_p: Tensor[N, 10], pred_q: Tensor[N, 10], save_path: str)`
+    -> `None`
+  - `plot_metrics_comparison(results_dict: dict, save_path: str)` -> `None`
+  - `plot_qualitative_examples(images: Tensor[N, 3, 32, 32], true_dists: Tensor[N, 10], pred_dists: Tensor[N, 10], entropies: Tensor[N], save_path: str)`
+    -> `None`
+  - `plot_per_class_predictions(images: Tensor, true_dists: Tensor, pred_dists: Tensor, hard_labels: Tensor, model_names: list, all_pred_dists: dict, save_path: str)`
+    -> `None`
+
+---
+
+### `utils/`
+
+**`utils/device.py`**
+
+- **Summary**: Device selection wrapper.
+- **Details**: Returns `cuda` if you have Nvidia, `mps` if you have Mac, or
+  `cpu` if you are poor. Returns context managers for mixed precision.
+  - `get_device()` -> `torch.device`
+  - `get_autocast_context(device: torch.device)` -> `torch.amp.autocast`
+  - `move_batch_to_device(images: Tensor, soft_labels: Tensor, hard_labels: Tensor, device: torch.device)`
+    -> `tuple[Tensor, Tensor, Tensor]`
+
+---
+
+### The Graveyards
+
+**`analysis/cifar10h_analysis.py`**
+
+- Computes classical entropy without a neural net to generate true vs pred
+  histograms.
+  - `compute_shannon_entropy(probs: np.ndarray[N, 10], eps: float)` ->
+    `np.ndarray[N]`.
+  - `plot_entropy_analysis(true_probs: np.ndarray, pred_probs: np.ndarray, save_path: str)`
+    -> `None`.
+
+**`explainability/*`**, **`visualisations/*`**, **`tests/*`**
+
+- **Summary**: A monument to broken promises.
+- **Details**: You made 11 files across these three directories. Every single
+  one of them is entirely blank. Delete them. They make the repository look like
+  an abandoned construction site.
+
 ===== ./explainability/__init__.py =====
 
 ===== ./explainability/grad_cam.py =====
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import cv2
 
+class GradCAM:
+    def __init__(self, model: nn.Module, target_layer: nn.Module):
+        self.model = model
+        self.target_layer = target_layer
+        self._gradients = None
+        self._activations = None
+        self._register_hooks()
+
+    def _register_hooks(self):
+        def forward_hook(module, input, output):
+            self._activations = output.detach()
+        def backward_hook(module, grad_in, grad_out):
+            self._gradients = grad_out[0].detach()
+        self.target_layer.register_forward_hook(forward_hook)
+        self.target_layer.register_full_backward_hook(backward_hook)
+
+    def generate(self, image: torch.Tensor, target_class=None, strategy="top_pred"):
+        self.model.eval()
+        image = image.requires_grad_(True)
+        logits = self.model(image)
+        probs = F.softmax(logits, dim=1)
+
+        if target_class is not None:
+            score = probs[0, target_class]
+        elif strategy == "top_pred":
+            score = probs.max(dim=1)[0]  # just a scalar
+        elif strategy == "entropy_weighted":
+            eps = 1e-12
+            weights = -(probs * torch.log(probs + eps))
+            score = (weights * probs).sum()
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+        self.model.zero_grad()
+        score.backward()
+        cam = self._compute_cam()
+        return cam
+
+    def _compute_cam(self):
+        grads = self._gradients[0]  # (C, H, W)
+        acts  = self._activations[0] # (C, H, W)
+        weights = grads.mean(dim=(1,2))
+        cam = (weights[:, None, None] * acts).sum(dim=0)
+        cam = F.relu(cam)
+        cam = cam.cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        return cam
+
+    @staticmethod
+    def overlay(raw_image: np.ndarray, cam: np.ndarray, alpha=0.45):
+        h, w = raw_image.shape[:2]
+        cam_resized = cv2.resize(cam, (w, h), interpolation=cv2.INTER_LINEAR)
+        heatmap = cv2.applyColorMap((cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+        img_float = raw_image.astype(np.float32)
+        if img_float.max() > 1.0:
+            img_float /= 255.0
+        return np.clip((1 - alpha) * img_float + alpha * heatmap, 0, 1)
 ===== ./README.md =====
 # Predicting Human Annotator Disagreement on CIFAR-10
 
 ## Overview
 
-This project predicts the full distribution of human annotator labels for CIFAR-10 images. Rather than predicting a single hard class, the model outputs a 10-dimensional probability distribution representing disagreement among ~50 human annotators per image.
+This project pretends to solve human annotator disagreement by predicting the
+full distribution of human annotator labels for CIFAR-10 images. Rather than
+predicting a single hard class, the model outputs a 10-dimensional probability
+distribution representing disagreement among ~50 human annotators per image.
 
-**Task**: Given an image, predict the soft label distribution (how annotators voted across 10 classes).
+For a complete, brutally honest breakdown of the project architecture and
+file-by-file documentation, see [`docs/overview.md`](docs/overview.md).
+
+**Task**: Given an image, predict the soft label distribution (how annotators
+voted across 10 classes).
 
 ---
 
 ## Data Pipeline
 
-The data pipelining phase provides a complete, production-ready data loading and processing infrastructure.
+The data pipelining phase provides a complete, production-ready data loading and
+processing infrastructure.
 
 ### Core Components
 
 #### 1. **Configuration** (`training/config.py`)
+
 Centralized configuration with runtime validation:
+
 - Random seed: `FIXED_SEED = 42` (PyTorch, NumPy, CUDA deterministic)
 - Train/Val/Test split: 60% / 20% / 20% (6000 / 2000 / 2000 images)
 - Data augmentation: RandomHorizontalFlip + RandomCrop (train only)
@@ -1972,23 +2530,31 @@ Centralized configuration with runtime validation:
 - Output directories: Auto-created checkpoints, plots, logs
 
 #### 2. **Dataset Loading** (`data/dataset.py`)
+
 `CIFAR10HWrapper` class handles:
+
 - Loading CIFAR-10 images from torchvision
 - Aligning with CIFAR-10H soft labels (10-dimensional probability vectors)
 - Soft label validation (sum-to-1 check, normalization)
 - Entropy computation per image (Shannon entropy in bits)
 
 #### 3. **Data Pipeline** (`data/pipeline.py`)
+
 Core functions:
+
 - `set_seed()` - Reproducibility across all libraries
 - `get_transforms()` - Per-split augmentation (train vs. val/test)
 - `load_full_dataset()` - Load CIFAR-10H wrapper
-- `create_splits()` - Stratified train/val/test splitting (preserves class distribution)
+- `create_splits()` - Stratified train/val/test splitting (preserves class
+  distribution)
 - `create_dataloaders()` - Create PyTorch DataLoaders with optimal settings
-- `run_sanity_checks()` - 7-point validation (soft label sums, NaN, entropy bounds, etc.)
+- `run_sanity_checks()` - 7-point validation (soft label sums, NaN, entropy
+  bounds, etc.)
 
 #### 4. **Statistics & Analysis** (`data/statistics.py`)
+
 Compute dataset statistics:
+
 - Per-image entropy (Shannon: H = -Σ p·log₂(p))
 - Per-class average entropy
 - Annotator confusion matrix (true class × annotator response)
@@ -1996,7 +2562,9 @@ Compute dataset statistics:
 - High/low entropy examples identification
 
 #### 5. **Visualizations** (`data/visualization.py`)
+
 Generate 4 required plots (saved to `outputs/plots/`):
+
 1. **Entropy histogram** - Distribution of disagreement across images
 2. **Per-class entropy bar chart** - Which classes have highest disagreement
 3. **Annotator confusion matrix** - Systematic annotation patterns
@@ -2005,11 +2573,13 @@ Generate 4 required plots (saved to `outputs/plots/`):
 ### Usage
 
 **One-command data pipeline orchestration:**
+
 ```bash
 python main_data.py
 ```
 
 This runs all 7 steps:
+
 1. Set reproducible seed
 2. Load CIFAR-10H (10,000 images)
 3. Run sanity checks
@@ -2019,6 +2589,7 @@ This runs all 7 steps:
 7. Create DataLoaders
 
 **Output:**
+
 - Console: Dataset statistics and verification results
 - Files: 4 PNG plots in `outputs/plots/`
 - Python: DataLoaders ready for training
@@ -2029,7 +2600,8 @@ This runs all 7 steps:
 python verify_pipeline.py
 ```
 
-Runs 30-second sanity checks without generating visualizations (useful for development).
+Runs 30-second sanity checks without generating visualizations (useful for
+development).
 
 ### Data Module Interface
 
@@ -2049,57 +2621,42 @@ from data import (
 
 ---
 
-## Project Structure
+## Project Structure (For details, see `docs/overview.md`)
 
 ```
 annotater-disagreement-cifar10-main/
-├── data/                          # Data pipeline (COMPLETE)
-│   ├── __init__.py
+├── data/                          # Data pipeline
 │   ├── dataset.py                 # CIFAR10HWrapper class
 │   ├── pipeline.py                # Loading, splitting, dataloaders
-│   ├── statistics.py              # Entropy, confusion matrix
-│   ├── utils.py
-│   └── visualization.py           # 4 required plots
+│   ├── statistics.py              # Entropy computations
+│   └── visualization.py           # Generation of plots
 ├── training/                      # Training configuration
 │   ├── config.py                  # Centralized settings
-│   ├── train.py                   # Training loop
-│   ├── metrics_logger.py
-│   └── __init__.py
-├── models/                        # Pre-built model
-│   ├── cifar_resnet.py
-│   ├── heads.py
-│   ├── weights/
-│   └── __init__.py
-├── losses/                        # Loss functions (to implement)
-│   ├── __init__.py
-│   └── utils.py
-├── evaluation/                    # Evaluation metrics (to implement)
-│   ├── __init__.py
+│   ├── train.py                   # Main PyTorch loop
+│   └── metrics_logger.py          # CSV/NPY logging
+├── models/                        # Pre-built models
+│   └── cifar_resnet.py            # ResNet-18 + Prediction Heads
+├── losses/                        # Loss functions
+│   ├── kl_divergence.py
+│   ├── js_divergence.py
+│   ├── emd_loss.py
+│   ├── custom_losses.py
+│   └── __init__.py                # Factory function
+├── evaluation/                    # Evaluation metrics and plotting
+│   ├── eval.py
 │   ├── metrics.py
-│   └── robustness.py
-├── explainability/                # Grad-CAM (to implement)
-│   ├── grad_cam.py
-│   └── __init__.py
+│   ├── robustness.py
+│   └── visualize.py
+├── explainability/                # Completely abandoned
 ├── utils/                         # Utilities
 │   └── device.py
-├── outputs/                       # Generated outputs
-│   ├── checkpoints/
-│   ├── figures/
-│   ├── logs/
-│   └── plots/                     # Visualization outputs
-├── experiments/                   # Config-driven experiments
-│   ├── run.py
-│   └── configs/
-├── notebooks/                     # Analysis notebooks
-│   └── 00_data_exploration.ipynb
-├── tests/                         # Unit tests
-│   ├── test_data.py
-│   ├── test_losses.py
-│   └── test_models.py
-├── requirements.txt
+├── outputs/                       # Generated outputs go here
+├── experiments/                   # Glorified bash scripts config runner
+├── tests/                         # Empty python files
 ├── main_data.py                   # Data pipeline orchestrator
-├── verify_pipeline.py             # Quick verification
-└── README.md
+├── abalation.py                   # CSV aggregation (spelled wrong)
+└── docs/
+    └── overview.md                # The real documentation
 ```
 
 ---
@@ -2115,6 +2672,7 @@ matplotlib
 ```
 
 Install:
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -2124,24 +2682,29 @@ pip install -r requirements.txt
 ## Key Design Decisions
 
 ### 1. Soft Label Validation
+
 - All soft labels normalized to sum to 1.0 (atol=1e-5)
 - NaN/inf detection prevents silent failures
 
 ### 2. Deterministic Reproducibility
+
 - Fixed seed (42) set at module import time
 - CUDA determinism enabled
 - Stratified splitting preserves class balance
 
 ### 3. Data Augmentation Strategy
+
 - **Train**: RandomHorizontalFlip (50%) + RandomCrop(32, pad=4)
 - **Val/Test**: No augmentation (identity transforms only)
 - Prevents data leakage during evaluation
 
 ### 4. Per-Split Transforms
+
 - Different transforms applied per split using `TransformWrapper`
 - Ensures test set never sees augmented versions
 
 ### 5. Windows Compatibility
+
 - `num_workers=0` in DataLoaders (Windows multiprocessing limitation)
 - All path handling uses `pathlib` for cross-platform compatibility
 
@@ -2150,6 +2713,7 @@ pip install -r requirements.txt
 ## Dataset Statistics (CIFAR-10H)
 
 From `main_data.py` output:
+
 - Total images: 10,000
 - Training: 6,000 (60%)
 - Validation: 2,000 (20%)
@@ -2158,39 +2722,6 @@ From `main_data.py` output:
 - Majority agreement: 99.2%
 - Mean entropy: 0.2228 bits
 - Max entropy: 2.8602 bits (theoretical max: 3.3219 bits)
-
----
-
-## Workflow for Next Phase
-
-To integrate this pipeline with training:
-
-```python
-from training.config import FIXED_SEED, BATCH_SIZE, NUM_WORKERS
-from data import (
-    set_seed,
-    load_full_dataset,
-    create_splits,
-    create_dataloaders,
-    run_sanity_checks,
-)
-
-# Initialize
-set_seed(FIXED_SEED)
-
-# Load and validate
-dataset = load_full_dataset()
-run_sanity_checks(dataset)
-
-# Create splits and loaders
-splits = create_splits(dataset, train_ratio=0.6, val_ratio=0.2)
-dataloaders = create_dataloaders(splits, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
-
-# Now use dataloaders in training loop
-train_loader = dataloaders['train']
-val_loader = dataloaders['val']
-test_loader = dataloaders['test']
-```
 
 ---
 
@@ -2412,6 +2943,62 @@ if __name__ == "__main__":
         'MLP head': 0.38,    'Frozen backbone': 0.47,
     })
     print("Done. Check outputs/ folder.")
+
+def plot_per_class_predictions(images: torch.Tensor, true_dists: torch.Tensor,
+                               pred_dists: torch.Tensor, hard_labels: torch.Tensor,
+                               model_names: list, all_pred_dists: dict,
+                               save_path="outputs/eval/per_class_predictions.png"):
+    """
+    For each of the 10 CIFAR classes, pick 1 random sample.
+    Show: image | true dist bar | top-3 model pred dist bars.
+    """
+    CLASSES = ['airplane','automobile','bird','cat','deer',
+               'dog','frog','horse','ship','truck']
+    
+    n_models = len(model_names)
+    fig, axes = plt.subplots(10, 2 + n_models, figsize=(5 * (2 + n_models), 30))
+    colors = ['steelblue', 'darkorange', 'seagreen']
+
+    for cls_idx in range(10):
+        # Pick a random sample from this class
+        cls_mask = (hard_labels == cls_idx).nonzero(as_tuple=True)[0]
+        rand_pick = cls_mask[torch.randint(len(cls_mask), (1,))].item()
+
+        # Column 0: Image
+        ax_img = axes[cls_idx, 0]
+        if images is not None:
+            img = images[rand_pick].permute(1, 2, 0).numpy()
+            img = (img - img.min()) / (img.max() - img.min() + 1e-9)
+            ax_img.imshow(img)
+        ax_img.set_title(f"Class: {CLASSES[cls_idx]}", fontsize=9, fontweight='bold')
+        ax_img.axis('off')
+
+        # Column 1: True distribution
+        ax_true = axes[cls_idx, 1]
+        true_vals = true_dists[rand_pick].numpy()
+        bars = ax_true.bar(range(10), true_vals, color='gray', alpha=0.7)
+        ax_true.set_xticks(range(10))
+        ax_true.set_xticklabels(CLASSES, rotation=45, ha='right', fontsize=6)
+        ax_true.set_ylim(0, 1)
+        ax_true.set_title("True Dist", fontsize=8)
+        ax_true.set_ylabel("Prob", fontsize=7)
+
+        # Columns 2+: Model predictions
+        for m_idx, model_name in enumerate(model_names):
+            ax_pred = axes[cls_idx, 2 + m_idx]
+            pred_vals = all_pred_dists[model_name][rand_pick].numpy()
+            ax_pred.bar(range(10), pred_vals, color=colors[m_idx], alpha=0.8)
+            ax_pred.set_xticks(range(10))
+            ax_pred.set_xticklabels(CLASSES, rotation=45, ha='right', fontsize=6)
+            ax_pred.set_ylim(0, 1)
+            ax_pred.set_title(f"{model_name}", fontsize=8)
+
+    plt.suptitle("Per-Class Predictions: Image + True vs Predicted Distributions (Top 3 Models)",
+                 fontsize=13, y=1.002)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f" Saved: {save_path}")
 ===== ./evaluation/robustness.py =====
 import torch
 import numpy as np
@@ -2494,152 +3081,245 @@ from models.cifar_resnet import build_soft_label_model
 from data.pipeline import load_full_dataset, create_splits, create_dataloaders
 from evaluation.metrics import run_all_metrics, compute_entropy
 from utils.device import get_device
-from evaluation.robustness import ood_corruption_check, per_class_kl
+from evaluation.robustness import (
+    annotator_subsampling_check,
+    ood_corruption_check,
+    per_class_kl
+)
 from evaluation.visualize import (
     plot_entropy_scatter,
     plot_metrics_comparison,
     plot_qualitative_examples,
     plot_ablation_summary,
 )
+from analysis.cifar10h_analysis import (
+    plot_entropy_analysis,
+    plot_distribution_comparison,
+    plot_gradcam_grid,
+    plot_failure_cases,
+    plot_robustness_curves,
+    plot_per_class_entropy_calibration,
+    plot_entropy_reliability_diagram,
+    plot_training_curves,
+    GradCAM,
+)
 
+# Map your checkpoints to their file paths. Adjust as needed.
 CHECKPOINTS = {
-    "kl_linear":               "outputs/checkpoints/kl_linear/best.pth",
-    "kl_mlp":                  "outputs/checkpoints/kl_mlp/best.pth",
-    "js_linear":               "outputs/checkpoints/js_linear/best.pth",
-    "js_mlp":                  "outputs/checkpoints/js_mlp/best.pth",
-    "custom_composite_linear": "outputs/checkpoints/custom_composite_linear/best.pth",
-    "custom_composite_mlp":    "outputs/checkpoints/custom_composite_mlp/best.pth",
-    "emd_linear":              "outputs/checkpoints/emd_linear/best.pth",
-    "emd_mlp":                 "outputs/checkpoints/emd_mlp/best.pth",
+    "kl_linear_pt_cifar10":   "outputs/checkpoints/kl_linear_pt_cifar10_best.pth",
+    "kl_mlp_pt_cifar10":      "outputs/checkpoints/kl_mlp_pt_cifar10_best.pth",
+    "js_linear_pt_cifar10":   "outputs/checkpoints/js_linear_pt_cifar10_best.pth",
+    "js_mlp_pt_cifar10":      "outputs/checkpoints/js_mlp_pt_cifar10_best.pth",
+    "custom_linear_pt_cifar10": "outputs/checkpoints/custom_composite_linear_pt_cifar10_best.pth",
+    "custom_mlp_pt_cifar10":    "outputs/checkpoints/custom_composite_mlp_pt_cifar10_best.pth",
+    # Add temperature variants if trained: e.g., "custom_mlp_pt_cifar10_temp": ...
 }
 
-
-def load_model(checkpoint_path, head_type, device):
-    model = build_soft_label_model(head_type=head_type, pretrained=False)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    
+def load_model_from_ckpt(ckpt_path, device, head_type='linear', use_temperature=False):
+    model = build_soft_label_model(head_type=head_type, pretrained_type='random',
+                                   use_temperature=use_temperature)
+    ckpt = torch.load(ckpt_path, map_location=device)
     state_dict = ckpt['model_state_dict']
-    
-    # Strip _orig_mod. prefix added by torch.compile()
-    cleaned = {
-        k.replace("_orig_mod.", ""): v 
-        for k, v in state_dict.items()
-    }
-    
+    cleaned = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(cleaned)
     model.to(device)
     model.eval()
-    print(f"  Loaded: {checkpoint_path}  (epoch {ckpt.get('epoch','?')}, val_loss={ckpt.get('val_loss',0):.4f})")
     return model
 
-
-def run_inference(model, test_loader, device):
+def run_analysis(model, test_loader, device, output_dir='outputs/eval'):
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
     all_preds, all_true, all_hard, all_images = [], [], [], []
     with torch.no_grad():
         for images, soft_labels, hard_labels in test_loader:
-            images      = images.to(device, non_blocking=True)
-            soft_labels = soft_labels.to(device, non_blocking=True)
-            pred_q      = model(images)
+            images = images.to(device)
+            soft_labels = soft_labels.to(device)
+            pred_q = model(images)
             all_preds.append(pred_q.cpu())
             all_true.append(soft_labels.cpu())
             all_hard.append(hard_labels)
-            all_images.append(images.cpu())        
-    return (
-        torch.cat(all_preds,  dim=0),   # (N, 10)
-        torch.cat(all_true,   dim=0),   # (N, 10)
-        torch.cat(all_hard,   dim=0),   # (N,)
-        torch.cat(all_images, dim=0),   # (N, 3, 32, 32)  
-    )
+            all_images.append(images.cpu())
 
+    pred_q = torch.cat(all_preds, dim=0)
+    true_p = torch.cat(all_true, dim=0)
+    hard_labels = torch.cat(all_hard, dim=0)
+    raw_images = torch.cat(all_images, dim=0)  # normalized
+
+    # Denormalize images for Grad-CAM and display
+    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1,3,1,1)
+    std  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1,3,1,1)
+    images_raw = (raw_images * std + mean).clamp(0,1).permute(0,2,3,1).numpy()
+
+    # Core metrics
+    metrics = run_all_metrics(true_p, pred_q)
+    print("\n=== Test Metrics ===")
+    for k,v in metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    # Required plots
+    plot_entropy_scatter(true_p, pred_q, save_path=os.path.join(output_dir, "entropy_scatter.png"))
+    plot_qualitative_examples(raw_images.permute(0,3,1,2)[:1000], true_p[:1000], pred_q[:1000],
+                              compute_entropy(true_p[:1000]), save_path=os.path.join(output_dir, "qualitative_grid.png"))
+    plot_failure_cases(images_raw, true_p.numpy(), pred_q.numpy(), save_path=os.path.join(output_dir, "failure_cases.png"))
+    plot_entropy_analysis(true_p.numpy(), pred_q.numpy(), save_path=os.path.join(output_dir, "entropy_analysis.png"))
+    plot_distribution_comparison(images_raw[:1000], true_p.numpy()[:1000], pred_q.numpy()[:1000],
+                                 save_path=os.path.join(output_dir, "distribution_comparison.png"))
+
+    # Grad-CAM (requires target layer)
+    backbone = model.backbone
+    target_layer = backbone.layer4[-1]  # last basic block
+    plot_gradcam_grid(model, target_layer, raw_images[:1000], images_raw[:1000], true_p.numpy()[:1000],
+                      pred_q.numpy()[:1000], save_path=os.path.join(output_dir, "gradcam_grid.png"))
+
+    # Robustness: annotation subsampling
+    # Need raw counts – we don't have them in this script. We'll skip if not available.
+    # But we can still call ood corruption and per-class KL.
+    print("\n=== OOD Corruption Check ===")
+    ood_results = ood_corruption_check(model, raw_images, severities=[0.05,0.1,0.2,0.3,0.5])
+    plot_robustness_curves(model, raw_images, device, save_path=os.path.join(output_dir, "robustness_entropy.png"))
+
+    print("\n=== Per-Class KL ===")
+    per_class_kl(true_p, pred_q, hard_labels)
+
+    # Advanced plots
+    plot_per_class_entropy_calibration(true_p.numpy(), pred_q.numpy(),
+                                       save_path=os.path.join(output_dir, "per_class_entropy_cal.png"))
+    plot_entropy_reliability_diagram(true_p.numpy(), pred_q.numpy(),
+                                    save_path=os.path.join(output_dir, "entropy_reliability.png"))
 
 def main():
     device = get_device()
-    os.makedirs("outputs/eval", exist_ok=True)
+    # Load test data
+    dataset = load_full_dataset()
+    splits = create_splits(dataset)
+    loaders = create_dataloaders(splits)
+    test_loader = loaders['test']
 
-    # Load test data 
-    print("\n[1/4] Loading test data...")
-    dataset  = load_full_dataset()
-    splits   = create_splits(dataset)
-    loaders  = create_dataloaders(splits)
-    test_loader = loaders["test"]
-    print(f"  Test set size: {len(splits['test'])} images")
-
-    # Run eval for every checkpoint 
-    print("\n[2/4] Running inference on all models...")
-    all_results = {}
-
+    # Evaluate each model
+    results_summary = {}
     for name, ckpt_path in CHECKPOINTS.items():
-        print(f"\n  → {name}")
-        head_type = "mlp" if "mlp" in name else "linear"
-        model  = load_model(ckpt_path, head_type, device)
-        pred_q, true_p, hard_labels, images = run_inference(model, test_loader, device)
-        metrics = run_all_metrics(true_p, pred_q)
-        all_results[name] = {
-            "metrics":     metrics,
-            "pred_q":      pred_q,
-            "true_p":      true_p,
-            "hard_labels": hard_labels,
-            "images":      images,      
-        }
-        print(f"     KL={metrics['kl_divergence']:.4f}  "
-              f"JSD={metrics['jsd']:.4f}  "
-              f"Pearson={metrics['pearson_r']:.4f}  "
-              f"P@100={metrics['precision@100']:.4f}")
+        if not os.path.exists(ckpt_path):
+            print(f"Checkpoint not found: {ckpt_path}, skipping {name}")
+            continue
+        print(f"\n====== Evaluating {name} ======")
+        head = 'mlp' if 'mlp' in name else 'linear'
+        use_temp = '_temp' in name
+        model = load_model_from_ckpt(ckpt_path, device, head, use_temperature=use_temp)
+        run_analysis(model, test_loader, device, output_dir=f'outputs/eval/{name}')
 
-    # Print full metrics table 
-    print("\n[3/4] Full Metrics Table")
-    print(f"{'Model':<30} {'KL':>7} {'JSD':>7} {'Cos':>7} {'Pear':>7} {'Spear':>7} {'P@100':>7} {'P@500':>7}")
-    print("-" * 90)
-    for name, res in all_results.items():
-        m = res["metrics"]
-        print(f"{name:<30} {m['kl_divergence']:>7.4f} {m['jsd']:>7.4f} "
-              f"{m['cosine_sim']:>7.4f} {m['pearson_r']:>7.4f} "
-              f"{m['spearman_r']:>7.4f} {m['precision@100']:>7.4f} "
-              f"{m['precision@500']:>7.4f}")
+    # Global comparison plot (if multiple models evaluated)
+    # You can collect metrics from each run and call plot_metrics_comparison() here.
 
-    # Generate plots
-    print("\n[4/4] Generating plots...")
+if __name__ == '__main__':
+    main()
+===== ./.vscode/settings.json =====
+{
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
+}
 
-    # Pick best model by KL for scatter + qualitative plots
-    best_name = min(all_results, key=lambda n: all_results[n]["metrics"]["kl_divergence"])
-    print(f"  Best model by KL: {best_name}")
-    best = all_results[best_name]
+===== ./main.py =====
+#!/usr/bin/env python3
+"""
+One-shot pipeline: data -> training -> evaluation.
+Usage:   python main.py [--skip-data] [--skip-train] [--skip-eval]
+"""
 
-    plot_entropy_scatter(
-        best["true_p"], best["pred_q"],
-        save_path="outputs/eval/entropy_scatter.png"
-    )
-    plot_metrics_comparison(
-        {name: res["metrics"] for name, res in all_results.items()},
-        save_path="outputs/eval/metrics_comparison.png"
-    )
-    best_entropy = compute_entropy(best["true_p"])
-    plot_qualitative_examples(
-    best["images"], best["true_p"], best["pred_q"],   
-    best_entropy,
-    save_path="outputs/eval/qualitative_grid.png"
-    )
-    plot_ablation_summary(
-        {name: res["metrics"]["kl_divergence"] for name, res in all_results.items()},
-        save_path="outputs/eval/ablation_summary.png"
-    )
+import argparse
+import subprocess
+import sys
+import os
+import json
+import glob
+from pathlib import Path
 
-    print("\n[Bonus 1] OOD Corruption Check (best model)...")
-    ood_results = ood_corruption_check(
-        model=load_model(CHECKPOINTS["kl_linear"], "linear", device),
-        test_images=best["images"],
-        severities=[0.05, 0.1, 0.2, 0.3, 0.5]
-    )
+def run_data_pipeline():
+    print("\n" + "="*60)
+    print("STAGE 1: DATA PIPELINE")
+    print("="*60)
+    # The main_data.py script loads, checks, splits, and creates dataloaders
+    result = subprocess.run([sys.executable, "main_data.py"], capture_output=False)
+    if result.returncode != 0:
+        print("Data pipeline failed. Exiting.")
+        sys.exit(1)
 
-    print("\n[Bonus 2] Per-class KL (best model)...")
-    per_class_kl(best["true_p"], best["pred_q"], best["hard_labels"])
+def run_training():
+    print("\n" + "="*60)
+    print("STAGE 2: TRAINING ALL EXPERIMENTS")
+    print("="*60)
+    # The experiments/run.py script uses multiprocessing for GPU assignment
+    result = subprocess.run([sys.executable, "experiments/run.py"], capture_output=False)
+    if result.returncode != 0:
+        print("Training failed. Check experiments/run.py for errors.")
+        sys.exit(1)
 
-    print("\n Evaluation complete. Results saved to outputs/eval/") 
+def find_best_checkpoints(checkpoint_dir="outputs/checkpoints"):
+    """Find all *_best.pth files and return a dict of exp_name -> path."""
+    best = {}
+    for path in Path(checkpoint_dir).rglob("*_best.pth"):
+        # exp_name is the file name without _best.pth
+        name = path.stem.replace("_best", "")
+        best[name] = str(path)
+    return best
+
+def run_evaluation():
+    print("\n" + "="*60)
+    print("STAGE 3: EVALUATION ON ALL BEST CHECKPOINTS")
+    print("="*60)
+    # Use the evaluation/eval.py logic to load and evaluate all checkpoints.
+    # We'll import the load_model + run_analysis functions directly.
+    sys.path.insert(0, os.path.abspath("."))
+    import torch
+    from evaluation.eval import load_model_from_ckpt, run_analysis
+    from data.pipeline import load_full_dataset, create_splits, create_dataloaders
+    from utils.device import get_device
+
+    device = get_device()
+    dataset = load_full_dataset()
+    splits = create_splits(dataset)
+    loaders = create_dataloaders(splits)
+    test_loader = loaders["test"]
+
+    best_ckpts = find_best_checkpoints()
+    if not best_ckpts:
+        print("No best checkpoints found. Did training complete?")
+        sys.exit(1)
+
+    os.makedirs("outputs/eval", exist_ok=True)
+    for exp_name, ckpt_path in best_ckpts.items():
+        print(f"\n--- Evaluating {exp_name} ---")
+        # Determine head type and temperature from experiment name
+        head = "mlp" if "mlp" in exp_name else "linear"
+        use_temp = "_temp" in exp_name
+        model = load_model_from_ckpt(ckpt_path, device, head_type=head, use_temperature=use_temp)
+        output_dir = f"outputs/eval/{exp_name}"
+        run_analysis(model, test_loader, device, output_dir=output_dir)
+
+    # Optional: create a global metric comparison plot
+    from evaluation.visualize import plot_metrics_comparison
+    # collect metrics from saved files? For brevity, we skip automatic collection here;
+    # you can manually run the comparison after.
+
+    print("\nEvaluation complete. See outputs/eval/ for plots and metrics.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Full pipeline for CIFAR-10H disagreement project")
+    parser.add_argument("--skip-data", action="store_true", help="Skip data pipeline")
+    parser.add_argument("--skip-train", action="store_true", help="Skip training")
+    parser.add_argument("--skip-eval", action="store_true", help="Skip evaluation")
+    args = parser.parse_args()
+
+    if not args.skip_data:
+        run_data_pipeline()
+    if not args.skip_train:
+        run_training()
+    if not args.skip_eval:
+        run_evaluation()
+
+    print("\n===== END OF PIPELINE =====")
 
 if __name__ == "__main__":
     main()
-===== ./main.py =====
-
 ===== ./data/dataset/cifar-10h/README.md =====
 # CIFAR-10H
 
