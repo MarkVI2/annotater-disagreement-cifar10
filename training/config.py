@@ -34,7 +34,7 @@ assert abs((TRAIN_RATIO + VAL_RATIO + TEST_RATIO) - 1.0) < 1e-9, \
 # MODEL & TRAINING
 # ============================================================================
 BATCH_SIZE: int = 128
-NUM_WORKERS: int = 4
+NUM_WORKERS: int = 8
 """Number of workers for DataLoader."""
 
 # ============================================================================

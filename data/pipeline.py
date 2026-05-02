@@ -51,8 +51,8 @@ def set_seed(seed: int = FIXED_SEED) -> None:
         torch.cuda.manual_seed_all(seed)
     
     # For reproducibility (at the cost of some speed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
 
 
 def get_transforms(is_train: bool) -> transforms.Compose:

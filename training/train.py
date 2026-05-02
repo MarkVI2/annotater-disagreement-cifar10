@@ -92,6 +92,7 @@ def main():
     # ---- Model ----
     model = build_soft_label_model(head_type=args.head, pretrained=args.pretrained)
     model = model.to(device)
+    model = torch.compile(model, mode='reduce-overhead')
 
     # ---- Loss function ----
     loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
