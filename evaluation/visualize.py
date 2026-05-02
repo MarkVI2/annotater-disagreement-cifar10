@@ -132,3 +132,59 @@ if __name__ == "__main__":
         'MLP head': 0.38,    'Frozen backbone': 0.47,
     })
     print("Done. Check outputs/ folder.")
+
+def plot_per_class_predictions(images: torch.Tensor, true_dists: torch.Tensor,
+                               pred_dists: torch.Tensor, hard_labels: torch.Tensor,
+                               model_names: list, all_pred_dists: dict,
+                               save_path="outputs/eval/per_class_predictions.png"):
+    """
+    For each of the 10 CIFAR classes, pick 1 random sample.
+    Show: image | true dist bar | top-3 model pred dist bars.
+    """
+    CLASSES = ['airplane','automobile','bird','cat','deer',
+               'dog','frog','horse','ship','truck']
+    
+    n_models = len(model_names)
+    fig, axes = plt.subplots(10, 2 + n_models, figsize=(5 * (2 + n_models), 30))
+    colors = ['steelblue', 'darkorange', 'seagreen']
+
+    for cls_idx in range(10):
+        # Pick a random sample from this class
+        cls_mask = (hard_labels == cls_idx).nonzero(as_tuple=True)[0]
+        rand_pick = cls_mask[torch.randint(len(cls_mask), (1,))].item()
+
+        # Column 0: Image
+        ax_img = axes[cls_idx, 0]
+        if images is not None:
+            img = images[rand_pick].permute(1, 2, 0).numpy()
+            img = (img - img.min()) / (img.max() - img.min() + 1e-9)
+            ax_img.imshow(img)
+        ax_img.set_title(f"Class: {CLASSES[cls_idx]}", fontsize=9, fontweight='bold')
+        ax_img.axis('off')
+
+        # Column 1: True distribution
+        ax_true = axes[cls_idx, 1]
+        true_vals = true_dists[rand_pick].numpy()
+        bars = ax_true.bar(range(10), true_vals, color='gray', alpha=0.7)
+        ax_true.set_xticks(range(10))
+        ax_true.set_xticklabels(CLASSES, rotation=45, ha='right', fontsize=6)
+        ax_true.set_ylim(0, 1)
+        ax_true.set_title("True Dist", fontsize=8)
+        ax_true.set_ylabel("Prob", fontsize=7)
+
+        # Columns 2+: Model predictions
+        for m_idx, model_name in enumerate(model_names):
+            ax_pred = axes[cls_idx, 2 + m_idx]
+            pred_vals = all_pred_dists[model_name][rand_pick].numpy()
+            ax_pred.bar(range(10), pred_vals, color=colors[m_idx], alpha=0.8)
+            ax_pred.set_xticks(range(10))
+            ax_pred.set_xticklabels(CLASSES, rotation=45, ha='right', fontsize=6)
+            ax_pred.set_ylim(0, 1)
+            ax_pred.set_title(f"{model_name}", fontsize=8)
+
+    plt.suptitle("Per-Class Predictions: Image + True vs Predicted Distributions (Top 3 Models)",
+                 fontsize=13, y=1.002)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f" Saved: {save_path}")

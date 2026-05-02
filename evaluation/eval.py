@@ -13,6 +13,7 @@ from evaluation.visualize import (
     plot_metrics_comparison,
     plot_qualitative_examples,
     plot_ablation_summary,
+    plot_per_class_predictions, 
 )
 
 CHECKPOINTS = {
@@ -148,6 +149,22 @@ def main():
     per_class_kl(best["true_p"], best["pred_q"], best["hard_labels"])
 
     print("\n Evaluation complete. Results saved to outputs/eval/") 
+
+    # Top 3 models by KL (lowest = best)
+    sorted_models = sorted(all_results, key=lambda n: all_results[n]["metrics"]["kl_divergence"])
+    top3 = sorted_models[:3]  # e.g. ['kl_linear', 'js_linear', 'custom_composite_linear']
+
+    print(f" Top 3 models: {top3}")
+
+    plot_per_class_predictions(
+        images=None,           # pass actual images tensor if available from test_loader
+        true_dists=all_results[top3[0]]["true_p"],
+        pred_dists=all_results[top3[0]]["pred_q"],
+        hard_labels=all_results[top3[0]]["hard_labels"],
+        model_names=top3,
+        all_pred_dists={name: all_results[name]["pred_q"] for name in top3},
+        save_path="outputs/eval/per_class_predictions.png"
+    )
 
 if __name__ == "__main__":
     main()
