@@ -7,164 +7,134 @@ from models.cifar_resnet import build_soft_label_model
 from data.pipeline import load_full_dataset, create_splits, create_dataloaders
 from evaluation.metrics import run_all_metrics, compute_entropy
 from utils.device import get_device
-from evaluation.robustness import ood_corruption_check, per_class_kl
+from evaluation.robustness import (
+    annotator_subsampling_check,
+    ood_corruption_check,
+    per_class_kl
+)
 from evaluation.visualize import (
     plot_entropy_scatter,
     plot_metrics_comparison,
     plot_qualitative_examples,
     plot_ablation_summary,
-    plot_per_class_predictions, 
+)
+from analysis.cifar10h_analysis import (
+    plot_entropy_analysis,
+    plot_distribution_comparison,
+    plot_gradcam_grid,
+    plot_failure_cases,
+    plot_robustness_curves,
+    plot_per_class_entropy_calibration,
+    plot_entropy_reliability_diagram,
+    plot_training_curves,
+    GradCAM,
 )
 
+# Map your checkpoints to their file paths. Adjust as needed.
 CHECKPOINTS = {
-    "kl_linear":               "outputs/checkpoints/kl_linear/best.pth",
-    "kl_mlp":                  "outputs/checkpoints/kl_mlp/best.pth",
-    "js_linear":               "outputs/checkpoints/js_linear/best.pth",
-    "js_mlp":                  "outputs/checkpoints/js_mlp/best.pth",
-    "custom_composite_linear": "outputs/checkpoints/custom_composite_linear/best.pth",
-    "custom_composite_mlp":    "outputs/checkpoints/custom_composite_mlp/best.pth",
-    "emd_linear":              "outputs/checkpoints/emd_linear/best.pth",
-    "emd_mlp":                 "outputs/checkpoints/emd_mlp/best.pth",
+    "kl_linear_pt_cifar10":   "outputs/checkpoints/kl_linear_pt_cifar10_best.pth",
+    "kl_mlp_pt_cifar10":      "outputs/checkpoints/kl_mlp_pt_cifar10_best.pth",
+    "js_linear_pt_cifar10":   "outputs/checkpoints/js_linear_pt_cifar10_best.pth",
+    "js_mlp_pt_cifar10":      "outputs/checkpoints/js_mlp_pt_cifar10_best.pth",
+    "custom_linear_pt_cifar10": "outputs/checkpoints/custom_composite_linear_pt_cifar10_best.pth",
+    "custom_mlp_pt_cifar10":    "outputs/checkpoints/custom_composite_mlp_pt_cifar10_best.pth",
+    # Add temperature variants if trained: e.g., "custom_mlp_pt_cifar10_temp": ...
 }
 
-
-def load_model(checkpoint_path, head_type, device):
-    model = build_soft_label_model(head_type=head_type, pretrained=False)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    
+def load_model_from_ckpt(ckpt_path, device, head_type='linear', use_temperature=False):
+    model = build_soft_label_model(head_type=head_type, pretrained_type='random',
+                                   use_temperature=use_temperature)
+    ckpt = torch.load(ckpt_path, map_location=device)
     state_dict = ckpt['model_state_dict']
-    
-    # Strip _orig_mod. prefix added by torch.compile()
-    cleaned = {
-        k.replace("_orig_mod.", ""): v 
-        for k, v in state_dict.items()
-    }
-    
+    cleaned = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     model.load_state_dict(cleaned)
     model.to(device)
     model.eval()
-    print(f"  Loaded: {checkpoint_path}  (epoch {ckpt.get('epoch','?')}, val_loss={ckpt.get('val_loss',0):.4f})")
     return model
 
-
-def run_inference(model, test_loader, device):
+def run_analysis(model, test_loader, device, output_dir='outputs/eval'):
+    os.makedirs(output_dir, exist_ok=True)
+    model.eval()
     all_preds, all_true, all_hard, all_images = [], [], [], []
     with torch.no_grad():
         for images, soft_labels, hard_labels in test_loader:
-            images      = images.to(device, non_blocking=True)
-            soft_labels = soft_labels.to(device, non_blocking=True)
-            pred_q      = model(images)
+            images = images.to(device)
+            soft_labels = soft_labels.to(device)
+            pred_q = model(images)
             all_preds.append(pred_q.cpu())
             all_true.append(soft_labels.cpu())
             all_hard.append(hard_labels)
-            all_images.append(images.cpu())        
-    return (
-        torch.cat(all_preds,  dim=0),   # (N, 10)
-        torch.cat(all_true,   dim=0),   # (N, 10)
-        torch.cat(all_hard,   dim=0),   # (N,)
-        torch.cat(all_images, dim=0),   # (N, 3, 32, 32)  
-    )
+            all_images.append(images.cpu())
 
+    pred_q = torch.cat(all_preds, dim=0)
+    true_p = torch.cat(all_true, dim=0)
+    hard_labels = torch.cat(all_hard, dim=0)
+    raw_images = torch.cat(all_images, dim=0)  # normalized
+
+    # Denormalize images for Grad-CAM and display
+    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(1,3,1,1)
+    std  = torch.tensor([0.2023, 0.1994, 0.2010]).view(1,3,1,1)
+    images_raw = (raw_images * std + mean).clamp(0,1).permute(0,2,3,1).numpy()
+
+    # Core metrics
+    metrics = run_all_metrics(true_p, pred_q)
+    print("\n=== Test Metrics ===")
+    for k,v in metrics.items():
+        print(f"  {k}: {v:.4f}")
+
+    # Required plots
+    plot_entropy_scatter(true_p, pred_q, save_path=os.path.join(output_dir, "entropy_scatter.png"))
+    plot_qualitative_examples(raw_images.permute(0,3,1,2)[:1000], true_p[:1000], pred_q[:1000],
+                              compute_entropy(true_p[:1000]), save_path=os.path.join(output_dir, "qualitative_grid.png"))
+    plot_failure_cases(images_raw, true_p.numpy(), pred_q.numpy(), save_path=os.path.join(output_dir, "failure_cases.png"))
+    plot_entropy_analysis(true_p.numpy(), pred_q.numpy(), save_path=os.path.join(output_dir, "entropy_analysis.png"))
+    plot_distribution_comparison(images_raw[:1000], true_p.numpy()[:1000], pred_q.numpy()[:1000],
+                                 save_path=os.path.join(output_dir, "distribution_comparison.png"))
+
+    # Grad-CAM (requires target layer)
+    backbone = model.backbone
+    target_layer = backbone.layer4[-1]  # last basic block
+    plot_gradcam_grid(model, target_layer, raw_images[:1000], images_raw[:1000], true_p.numpy()[:1000],
+                      pred_q.numpy()[:1000], save_path=os.path.join(output_dir, "gradcam_grid.png"))
+
+    # Robustness: annotation subsampling
+    # Need raw counts – we don't have them in this script. We'll skip if not available.
+    # But we can still call ood corruption and per-class KL.
+    print("\n=== OOD Corruption Check ===")
+    ood_results = ood_corruption_check(model, raw_images, severities=[0.05,0.1,0.2,0.3,0.5])
+    plot_robustness_curves(model, raw_images, device, save_path=os.path.join(output_dir, "robustness_entropy.png"))
+
+    print("\n=== Per-Class KL ===")
+    per_class_kl(true_p, pred_q, hard_labels)
+
+    # Advanced plots
+    plot_per_class_entropy_calibration(true_p.numpy(), pred_q.numpy(),
+                                       save_path=os.path.join(output_dir, "per_class_entropy_cal.png"))
+    plot_entropy_reliability_diagram(true_p.numpy(), pred_q.numpy(),
+                                    save_path=os.path.join(output_dir, "entropy_reliability.png"))
 
 def main():
     device = get_device()
-    os.makedirs("outputs/eval", exist_ok=True)
+    # Load test data
+    dataset = load_full_dataset()
+    splits = create_splits(dataset)
+    loaders = create_dataloaders(splits)
+    test_loader = loaders['test']
 
-    # Load test data 
-    print("\n[1/4] Loading test data...")
-    dataset  = load_full_dataset()
-    splits   = create_splits(dataset)
-    loaders  = create_dataloaders(splits)
-    test_loader = loaders["test"]
-    print(f"  Test set size: {len(splits['test'])} images")
-
-    # Run eval for every checkpoint 
-    print("\n[2/4] Running inference on all models...")
-    all_results = {}
-
+    # Evaluate each model
+    results_summary = {}
     for name, ckpt_path in CHECKPOINTS.items():
-        print(f"\n  → {name}")
-        head_type = "mlp" if "mlp" in name else "linear"
-        model  = load_model(ckpt_path, head_type, device)
-        pred_q, true_p, hard_labels, images = run_inference(model, test_loader, device)
-        metrics = run_all_metrics(true_p, pred_q)
-        all_results[name] = {
-            "metrics":     metrics,
-            "pred_q":      pred_q,
-            "true_p":      true_p,
-            "hard_labels": hard_labels,
-            "images":      images,      
-        }
-        print(f"     KL={metrics['kl_divergence']:.4f}  "
-              f"JSD={metrics['jsd']:.4f}  "
-              f"Pearson={metrics['pearson_r']:.4f}  "
-              f"P@100={metrics['precision@100']:.4f}")
+        if not os.path.exists(ckpt_path):
+            print(f"Checkpoint not found: {ckpt_path}, skipping {name}")
+            continue
+        print(f"\n====== Evaluating {name} ======")
+        head = 'mlp' if 'mlp' in name else 'linear'
+        use_temp = '_temp' in name
+        model = load_model_from_ckpt(ckpt_path, device, head, use_temperature=use_temp)
+        run_analysis(model, test_loader, device, output_dir=f'outputs/eval/{name}')
 
-    # Print full metrics table 
-    print("\n[3/4] Full Metrics Table")
-    print(f"{'Model':<30} {'KL':>7} {'JSD':>7} {'Cos':>7} {'Pear':>7} {'Spear':>7} {'P@100':>7} {'P@500':>7}")
-    print("-" * 90)
-    for name, res in all_results.items():
-        m = res["metrics"]
-        print(f"{name:<30} {m['kl_divergence']:>7.4f} {m['jsd']:>7.4f} "
-              f"{m['cosine_sim']:>7.4f} {m['pearson_r']:>7.4f} "
-              f"{m['spearman_r']:>7.4f} {m['precision@100']:>7.4f} "
-              f"{m['precision@500']:>7.4f}")
+    # Global comparison plot (if multiple models evaluated)
+    # You can collect metrics from each run and call plot_metrics_comparison() here.
 
-    # Generate plots
-    print("\n[4/4] Generating plots...")
-
-    # Pick best model by KL for scatter + qualitative plots
-    best_name = min(all_results, key=lambda n: all_results[n]["metrics"]["kl_divergence"])
-    print(f"  Best model by KL: {best_name}")
-    best = all_results[best_name]
-
-    plot_entropy_scatter(
-        best["true_p"], best["pred_q"],
-        save_path="outputs/eval/entropy_scatter.png"
-    )
-    plot_metrics_comparison(
-        {name: res["metrics"] for name, res in all_results.items()},
-        save_path="outputs/eval/metrics_comparison.png"
-    )
-    best_entropy = compute_entropy(best["true_p"])
-    plot_qualitative_examples(
-    best["images"], best["true_p"], best["pred_q"],   
-    best_entropy,
-    save_path="outputs/eval/qualitative_grid.png"
-    )
-    plot_ablation_summary(
-        {name: res["metrics"]["kl_divergence"] for name, res in all_results.items()},
-        save_path="outputs/eval/ablation_summary.png"
-    )
-
-    print("\n[Bonus 1] OOD Corruption Check (best model)...")
-    ood_results = ood_corruption_check(
-        model=load_model(CHECKPOINTS["kl_linear"], "linear", device),
-        test_images=best["images"],
-        severities=[0.05, 0.1, 0.2, 0.3, 0.5]
-    )
-
-    print("\n[Bonus 2] Per-class KL (best model)...")
-    per_class_kl(best["true_p"], best["pred_q"], best["hard_labels"])
-
-    print("\n Evaluation complete. Results saved to outputs/eval/") 
-
-    # Top 3 models by KL (lowest = best)
-    sorted_models = sorted(all_results, key=lambda n: all_results[n]["metrics"]["kl_divergence"])
-    top3 = sorted_models[:3]  # e.g. ['kl_linear', 'js_linear', 'custom_composite_linear']
-
-    print(f" Top 3 models: {top3}")
-
-    plot_per_class_predictions(
-        images=None,           # pass actual images tensor if available from test_loader
-        true_dists=all_results[top3[0]]["true_p"],
-        pred_dists=all_results[top3[0]]["pred_q"],
-        hard_labels=all_results[top3[0]]["hard_labels"],
-        model_names=top3,
-        all_pred_dists={name: all_results[name]["pred_q"] for name in top3},
-        save_path="outputs/eval/per_class_predictions.png"
-    )
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
