@@ -11,6 +11,8 @@ def sinkhorn_loss(pred_probs, target_probs, cost_matrix, epsilon=0.1, max_iter=5
     batch_size = pred_probs.shape[0]
     device = pred_probs.device
     
+    cost_matrix = cost_matrix.to(device)
+
     # Ensure positive masses
     a = pred_probs.clamp(min=1e-9)
     b = target_probs.clamp(min=1e-9)
