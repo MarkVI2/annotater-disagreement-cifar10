@@ -17,7 +17,8 @@ from training.config import (
 from training.metrics_logger import MetricsLogger
 from models.cifar_resnet import build_soft_label_model
 from utils.device import get_device, get_autocast_context
-from losses import get_loss_function      # we'll build this
+from losses import get_loss_function
+import json
 
 def train_one_epoch(model, loader, optimizer, device, scaler, autocast_ctx, loss_fn):
     model.train()
@@ -66,6 +67,7 @@ def main():
     parser.add_argument('--no_amp', action='store_true')
     parser.add_argument('--loss', type=str, default='kl', choices=['kl', 'js', 'emd', 'custom_composite'])
     parser.add_argument('--loss_beta', type=float, default=0.5, help='Weight for entropy penalty in custom composite loss')
+    parser.add_argument('--loss_epsilon', type=float, default=0.1, help='Epsilon for EMD loss')
     args = parser.parse_args()
 
     device = get_device()
@@ -92,7 +94,7 @@ def main():
     model = model.to(device)
 
     # ---- Loss function ----
-    loss_fn = get_loss_function(args.loss, beta=args.loss_beta)
+    loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
     print(f"Using loss: {args.loss}")
 
     # ---- Optimizer & Scheduler ----
@@ -107,7 +109,17 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     best_val_loss = float('inf')
 
-    logger = MetricsLogger(LOGS_DIR, filename=f'{args.loss}_metrics.csv')
+    exp_name = f'{args.loss}_{args.head}'
+    logger = MetricsLogger(LOGS_DIR, filename_prefix=exp_name)
+
+    # Save hyperparameters
+    os.makedirs(args.save_dir, exist_ok=True)
+    hyperparams = vars(args)
+    with open(os.path.join(args.save_dir, 'hyperparameters.json'), 'w') as f:
+        json.dump(hyperparams, f, indent=2)
+
+    # Pass epsilon to loss if using EMD
+    loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
 
     for epoch in range(1, args.epochs + 1):
         start_time = time.time()
