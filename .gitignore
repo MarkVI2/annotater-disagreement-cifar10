@@ -43,3 +43,13 @@ Thumbs.db
 .env
 .env.local
 codebase_dump.txt
+
+# Checkpoints — too large for GitHub (2GB)
+outputs/checkpoints/
+
+# The tar file
+*.gz
+*.tar
+
+# Jupyter
+.ipynb_checkpoints/
