@@ -20,6 +20,7 @@ from models.cifar_resnet import build_soft_label_model
 from utils.device import get_device, get_autocast_context
 from losses import get_loss_function
 
+
 def train_one_epoch(model, loader, optimizer, device, scaler, autocast_ctx, loss_fn):
     model.train()
     running_loss = 0.0
@@ -43,6 +44,7 @@ def train_one_epoch(model, loader, optimizer, device, scaler, autocast_ctx, loss
         running_loss += loss.item() * images.size(0)
     return running_loss / len(loader.dataset)
 
+
 def validate(model, loader, device, loss_fn):
     model.eval()
     running_loss = 0.0
@@ -54,6 +56,7 @@ def validate(model, loader, device, loss_fn):
             loss = loss_fn(pred_probs, soft_targets)
             running_loss += loss.item() * images.size(0)
     return running_loss / len(loader.dataset)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -95,7 +98,7 @@ def main():
     train_loader = loaders['train']
     val_loader = loaders['val']
 
-    # Model
+    # Model (NO torch.compile – it breaks with learnable temperature)
     model = build_soft_label_model(
         head_type=args.head,
         pretrained_type=args.pretrained_type,
@@ -103,11 +106,6 @@ def main():
         init_temp=args.init_temp
     )
     model = model.to(device)
-    try:
-        model = torch.compile(model, mode='reduce-overhead')
-        print("Model compiled with torch.compile")
-    except Exception as e:
-        print(f"torch.compile failed ({e}), using eager mode")
 
     # Loss
     loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
@@ -149,7 +147,6 @@ def main():
 
         logger.log(epoch, {'train_loss': train_loss, 'val_loss': val_loss})
 
-        # Checkpointing
         ckpt = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -177,6 +174,7 @@ def main():
         plot_training_curves(LOGS_DIR, exp_name)
     except Exception as e:
         print(f"Could not generate training curve plot: {e}")
+
 
 if __name__ == '__main__':
     main()

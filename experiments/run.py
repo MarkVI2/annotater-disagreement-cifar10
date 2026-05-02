@@ -14,8 +14,8 @@ PROJECT_ROOT = project_root
 # Experiment grid: losses, heads, pretrained_type (ablation A/B/C)
 losses = ['kl', 'js', 'custom_composite', 'emd']
 heads = ['linear', 'mlp']
-pretrained_types = ['random', 'cifar10', 'imagenet']   # ablation A + C (random = soft-only)
-use_temperature = [False, True]  # optional
+pretrained_types = ['random', 'cifar10', 'imagenet']
+use_temperature = [False, True]
 epochs = 60
 batch_size = 128
 lr = 1e-3
@@ -25,7 +25,6 @@ loss_epsilon = 0.1
 
 all_configs = []
 for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, use_temperature):
-    # Skip temperature for non-custom losses? No, temperature can be used with any loss, but we'll keep it for all for completeness.
     exp_name = f'{loss}_{head}_pt_{pt}'
     if temp:
         exp_name += '_temp'
@@ -47,24 +46,38 @@ for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, u
         cmd += " --use_temperature --init_temp 2.0"
     all_configs.append((exp_name, cmd, save_dir))
 
+
 def run_one(gpu_id, configs_for_gpu):
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
     for exp_name, cmd, save_dir in configs_for_gpu:
         print(f"[GPU {gpu_id}] Running: {cmd}")
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
         if result.returncode != 0:
-            print(f"Error on GPU {gpu_id}: {result.stderr}")
-        log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
-        best_val = 999.0
+            print(f"[GPU {gpu_id}] ERROR: Training failed for {exp_name}")
+            print("STDOUT:\n", result.stdout)
+            print("STDERR:\n", result.stderr)
+        else:
+            # Even if returncode 0, check log file
+            log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
+            if not log_csv.exists():
+                print(f"[GPU {gpu_id}] WARNING: log file not found for {exp_name} (stdout/stderr below)")
+                print("STDOUT:\n", result.stdout)
+                print("STDERR:\n", result.stderr)
+
+        # Read best validation loss from log (if exists)
         try:
             with open(log_csv, 'r') as f:
                 reader = csv.DictReader(f)
                 val_losses = [float(row['val_loss']) for row in reader if 'val_loss' in row]
                 best_val = min(val_losses) if val_losses else 999.0
         except Exception as e:
-            print(f"Could not read log for {exp_name}: {e}")
+            best_val = 999.0
+            print(f"[GPU {gpu_id}] Could not read log for {exp_name}: {e}")
+
         print(f"[GPU {gpu_id}] {exp_name} best val loss = {best_val:.4f}")
+
 
 def main():
     gpu_count = 2
@@ -91,10 +104,13 @@ def main():
                     best_val = min(val_losses) if val_losses else 999.0
             except:
                 pass
-            loss, head, pt_tag = exp_name.split('_')[0], exp_name.split('_')[1], exp_name.split('_')[2]
+            loss, head = exp_name.split('_')[0], exp_name.split('_')[1]
+            # simple parse to get pretrained_type
+            pt = exp_name.split('_')[3] if len(exp_name.split('_')) > 3 else 'unknown'
             temp = '_temp' in exp_name
-            writer.writerow([exp_name, loss, head, pt_tag, temp, best_val, save_dir])
+            writer.writerow([exp_name, loss, head, pt, temp, best_val, str(save_dir)])
     print(f"All experiments finished. Summary written to {results_file}")
+
 
 if __name__ == '__main__':
     main()
