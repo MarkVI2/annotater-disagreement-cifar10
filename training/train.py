@@ -103,7 +103,11 @@ def main():
         init_temp=args.init_temp
     )
     model = model.to(device)
-    model = torch.compile(model, mode='reduce-overhead')
+    try:
+        model = torch.compile(model, mode='reduce-overhead')
+        print("Model compiled with torch.compile")
+    except Exception as e:
+        print(f"torch.compile failed ({e}), using eager mode")
 
     # Loss
     loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
