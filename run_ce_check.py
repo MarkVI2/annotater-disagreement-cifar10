@@ -12,7 +12,12 @@ model.to(device).eval()
 
 dataset = load_full_dataset(DATA_DIR, CIFAR10H_PROBS_FILE)
 splits = create_splits(dataset, TRAIN_RATIO, VAL_RATIO, FIXED_SEED)
-loaders = create_dataloaders(splits, BATCH_SIZE, 0, {'val': get_transforms(False)})
+transforms_dict = {
+    'train': get_transforms(True),
+    'val': get_transforms(False),
+    'test': get_transforms(False)
+}
+loaders = create_dataloaders(splits, BATCH_SIZE, 0, transforms_dict)
 
 total_ce = 0
 with torch.no_grad():
