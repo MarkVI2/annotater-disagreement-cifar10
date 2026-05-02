@@ -1,0 +1,13 @@
+{
+  "head": "mlp",
+  "batch_size": 128,
+  "epochs": 60,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "save_dir": "/home/atharv/dnn/outputs/checkpoints/kl_mlp",
+  "pretrained": true,
+  "no_amp": false,
+  "loss": "kl",
+  "loss_beta": 0.5,
+  "loss_epsilon": 0.1
+}

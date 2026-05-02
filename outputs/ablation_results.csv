@@ -1,0 +1,9 @@
+loss,head,pretrained,best_val_loss,save_dir
+kl,linear,True,0.6278023805618286,outputs/checkpoints/kl_linear
+kl,mlp,True,0.7091953401565552,outputs/checkpoints/kl_mlp
+js,linear,True,0.13064295494556427,outputs/checkpoints/js_linear
+js,mlp,True,0.14443493247032166,outputs/checkpoints/js_mlp
+custom,composite_linear,True,0.97112096118927,outputs/checkpoints/custom_composite_linear
+custom,composite_mlp,True,1.0999334030151366,outputs/checkpoints/custom_composite_mlp
+emd,linear,True,0.18249202263355255,outputs/checkpoints/emd_linear
+emd,mlp,True,0.190756378531456,outputs/checkpoints/emd_mlp
