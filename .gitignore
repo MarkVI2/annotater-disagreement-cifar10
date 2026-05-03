@@ -52,4 +52,5 @@ outputs/checkpoints/
 
 # Jupyter
 .ipynb_checkpoints/
+*codebase_dump.txt*
 codebase_dump.txt

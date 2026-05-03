@@ -299,15 +299,12 @@ def plot_entropy_vs_gradcam(
     n_per_group: int = 4,
     save_path: str = "outputs/explainability/entropy_vs_gradcam.png",
 ) -> None:
-    """
-    Two-row comparison: top row = low-entropy images with their CAMs,
-    bottom row = high-entropy images. Demonstrates that diffuse CAMs
-    correlate with high annotator disagreement.
-
-    WHERE TO CALL: same as plot_grad_cam_grid.
-    """
     from evaluation.metrics import compute_entropy as _cE
     import torch as _torch
+
+    # Move images to the same device as the model
+    device = next(grad_cam.model.parameters()).device
+    images = images.to(device)
 
     H      = _cE(true_probs).numpy()
     sort_i = np.argsort(H)
