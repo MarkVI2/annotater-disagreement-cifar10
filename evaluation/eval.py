@@ -130,6 +130,30 @@ def run_analysis_for_model(model, test_loader, device, output_dir='outputs/eval'
     return metrics, true_p, pred_q, hard_labels, raw_images
 
 
+def build_ablation_summary(all_metrics: dict):
+    """Build a category -> best KL summary for the ablation chart."""
+    categories = {
+        "KL Loss":      lambda n: n.startswith('kl_'),
+        "JS Loss":      lambda n: n.startswith('js_'),
+        "Custom Loss":  lambda n: n.startswith('custom_composite_'),
+        "EMD Loss":     lambda n: n.startswith('emd_'),
+        "Init: random": lambda n: '_pt_random' in n,
+        "Init: CIFAR10": lambda n: '_pt_cifar10' in n,
+        "Init: ImageNet": lambda n: '_pt_imagenet' in n,
+        "Head: linear": lambda n: '_linear_' in n,
+        "Head: MLP":    lambda n: '_mlp_' in n,
+        "Temp: off":    lambda n: '_temp' not in n,
+        "Temp: on":     lambda n: '_temp' in n,
+    }
+    best_kl = {}
+    for cat, predicate in categories.items():
+        candidates = {n: m['kl_divergence'] for n, m in all_metrics.items() if predicate(n)}
+        if candidates:
+            best_name = min(candidates, key=candidates.get)
+            best_kl[cat] = candidates[best_name]
+    return best_kl
+
+
 def main():
     device = get_device()
     dataset = load_full_dataset()
@@ -142,9 +166,7 @@ def main():
         print("No best checkpoints found. Aborting.")
         return
 
-    # ------------------------------------------------------------
-    # 1. Compute metrics for ALL checkpoints (no per-model plots)
-    # ------------------------------------------------------------
+    # 1. Metrics for all checkpoints (no plots)
     all_metrics = {}
     print("\n[1/3] Computing metrics for all checkpoints...")
     for exp_name, ckpt_path in best_ckpts.items():
@@ -155,27 +177,19 @@ def main():
         all_metrics[exp_name] = metrics
         print(f"  {exp_name:50s}  KL={metrics['kl_divergence']:.4f}")
 
-    # ------------------------------------------------------------
-    # 2. Select representative models for per-model figures
-    #    (best linear/cifar10 for each loss function)
-    # ------------------------------------------------------------
+    # 2. Representative models for per-model figures
     representative_models = {}
     loss_functions = ['kl', 'js', 'custom_composite', 'emd']
     for loss in loss_functions:
-        # Prefer e.g. "kl_linear_pt_cifar10", fallback to any linear/cifar10 variant
         pattern = f'{loss}_linear_pt_cifar10'
         candidates = [n for n in best_ckpts if pattern in n]
         if not candidates:
-            candidates = [n for n in best_ckpts if loss in n]  # any variant of that loss
+            candidates = [n for n in best_ckpts if n.startswith(loss)]
         if candidates:
-            # Pick the one with lowest KL from all_metrics
             best_candidate = min(candidates, key=lambda n: all_metrics[n]['kl_divergence'])
             representative_models[loss] = best_candidate
             print(f"  Representative for {loss}: {best_candidate}")
-        else:
-            print(f"  No model found for loss {loss}")
 
-    # Generate per-model plots for each representative
     per_model_data = {}
     for loss, exp_name in representative_models.items():
         head = "mlp" if "mlp" in exp_name else "linear"
@@ -187,43 +201,34 @@ def main():
         )
         per_model_data[exp_name] = (true_p, pred_q, hard_labels, raw_images)
 
-    # ------------------------------------------------------------
-    # 3. Aggregate plots (using metrics from all or representative)
-    # ------------------------------------------------------------
+    # 3. Aggregate plots
     os.makedirs("outputs/eval/aggregated", exist_ok=True)
 
-    # Use only representative models for comparison bar chart (cleaner)
     rep_metrics = {name: all_metrics[name] for name in representative_models.values()}
     plot_metrics_comparison_bar(rep_metrics,
                                 save_path="outputs/eval/aggregated/metrics_comparison.png")
-    # Full metrics heatmap table can use all models
+    # Optional full table – still legible because it's limited by the updated function
     plot_metrics_table(all_metrics,
                        save_path="outputs/eval/aggregated/metrics_table.png")
     plot_precision_at_k(rep_metrics,
                         save_path="outputs/eval/aggregated/precision_at_k.png")
 
-    # Ablation summary (using KL from all models)
-    ablation_kl = {name: m["kl_divergence"] for name, m in all_metrics.items()}
-    plot_ablation_summary(ablation_kl,
+    ablation_data = build_ablation_summary(all_metrics)
+    plot_ablation_summary(ablation_data,
                           save_path="outputs/eval/aggregated/ablation_summary.png")
 
-    # ------------------------------------------------------------
-    # 4. Robustness & per-class analysis on the best overall model
-    # ------------------------------------------------------------
+    # Best model for robustness checks
     best_model_name = min(all_metrics, key=lambda n: all_metrics[n]["kl_divergence"])
     print(f"\nBest model by KL: {best_model_name}")
 
-    # Load best model and run full analysis (or reuse from per_model_data if it's among representatives)
     head = "mlp" if "mlp" in best_model_name else "linear"
     use_temp = "_temp" in best_model_name
     best_model = load_model_from_ckpt(best_ckpts[best_model_name], device,
                                       head_type=head, use_temperature=use_temp)
 
-    # Get data for best model
     if best_model_name in per_model_data:
         true_p_best, pred_q_best, hard_labels_best, images_best = per_model_data[best_model_name]
     else:
-        # Need to collect data
         best_model.eval()
         all_preds, all_true, all_hard, all_images = [], [], [], []
         with torch.no_grad():
@@ -245,7 +250,7 @@ def main():
     plot_per_class_kl_bar(pkl_dict, label=best_model_name,
                           save_path="outputs/eval/aggregated/per_class_kl.png")
 
-    # Annotator subsampling robustness
+    # Annotator subsampling
     counts_path = "data/cifar10h-counts.npy"
     if os.path.exists(counts_path):
         raw_counts_full = np.load(counts_path)
