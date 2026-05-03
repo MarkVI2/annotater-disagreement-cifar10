@@ -213,19 +213,12 @@ def plot_grad_cam_grid(
     strategy: str = "top_pred",
     save_path: str = "outputs/explainability/grad_cam_grid.png",
 ) -> None:
-    """
-    Grid layout:
-        rows = selected images (n_low low-entropy + n_high high-entropy)
-        cols = [original | Grad-CAM | overlay | bar chart p vs q]
-
-    WHERE TO CALL:
-        After load_model() + run_inference():
-            from visualisations.grad_cam_plots import GradCAM, plot_grad_cam_grid
-            gc = GradCAM(model, model.layer4[-1])
-            plot_grad_cam_grid(gc, test_images, true_p, pred_q)
-    """
     from evaluation.metrics import compute_entropy as _cE
     import torch as _torch
+
+    # -- Move images to the same device as the model --
+    device = next(grad_cam.model.parameters()).device
+    images = images.to(device)
 
     # Pick images
     H      = _cE(true_probs).numpy()
