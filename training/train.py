@@ -3,12 +3,10 @@ import os
 import time
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import tqdm
 import json
-import numpy as np
 
 from data.pipeline import load_full_dataset, create_splits, create_dataloaders, get_transforms
 from training.config import (
@@ -71,16 +69,13 @@ def main():
     parser.add_argument('--no_amp', action='store_true')
     parser.add_argument('--loss', type=str, default='kl',
                         choices=['kl', 'js', 'emd', 'custom_composite'])
-    parser.add_argument('--loss_beta', type=float, default=0.5,
-                        help='Weight for entropy penalty in custom composite loss')
-    parser.add_argument('--loss_epsilon', type=float, default=0.1,
-                        help='Epsilon for EMD loss')
-    parser.add_argument('--use_temperature', action='store_true',
-                        help='Use learnable temperature scaling head')
-    parser.add_argument('--init_temp', type=float, default=2.0,
-                        help='Initial temperature value')
-    parser.add_argument('--patience', type=int, default=15,
-                        help='Early stopping patience')
+    parser.add_argument('--loss_beta', type=float, default=0.5)
+    parser.add_argument('--loss_epsilon', type=float, default=0.1)
+    parser.add_argument('--use_temperature', action='store_true')
+    parser.add_argument('--init_temp', type=float, default=2.0)
+    parser.add_argument('--patience', type=int, default=15)
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume from the latest checkpoint if it exists')
     args = parser.parse_args()
 
     device = get_device()
@@ -98,6 +93,18 @@ def main():
     train_loader = loaders['train']
     val_loader = loaders['val']
 
+    # Experiment naming
+    pretrain_tag = f"pt_{args.pretrained_type}"
+    temp_tag = f"_temp{args.init_temp}" if args.use_temperature else ""
+    exp_name = f'{args.loss}_{args.head}_{pretrain_tag}{temp_tag}'
+    save_dir = args.save_dir  # already set by runner; we may override if not
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+    latest_path = os.path.join(save_dir, f'{exp_name}_latest.pth')
+    best_path = os.path.join(save_dir, f'{exp_name}_best.pth')
+
+    # Model
     model = build_soft_label_model(
         head_type=args.head,
         pretrained_type=args.pretrained_type,
@@ -105,7 +112,6 @@ def main():
         init_temp=args.init_temp
     )
     model = model.to(device)
-    model = torch.compile(model, mode='reduce-overhead')
 
     # Loss
     loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
@@ -120,23 +126,34 @@ def main():
     scaler = torch.cuda.amp.GradScaler() if (use_amp and device.type == 'cuda') else None
     autocast_ctx = get_autocast_context(device) if use_amp else torch.no_grad()
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(LOGS_DIR, exist_ok=True)
-
-    pretrain_tag = f"pt_{args.pretrained_type}"
-    temp_tag = f"_temp{args.init_temp}" if args.use_temperature else ""
-    exp_name = f'{args.loss}_{args.head}_{pretrain_tag}{temp_tag}'
-    logger = MetricsLogger(LOGS_DIR, filename_prefix=exp_name)
-
-    hyperparams = vars(args)
-    with open(os.path.join(args.save_dir, f'{exp_name}_hyperparameters.json'), 'w') as f:
-        json.dump(hyperparams, f, indent=2)
-
-    # Early stopping setup
+    # Resume logic
+    start_epoch = 1
     best_val_loss = float('inf')
     epochs_no_improve = 0
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume and os.path.exists(latest_path):
+        print(f"Resuming from {latest_path} ...")
+        checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
+        state = checkpoint.get('model_state_dict') or checkpoint.get('model')
+        if state:
+            cleaned = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+            model.load_state_dict(cleaned)
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+        if 'val_loss' in checkpoint:
+            best_val_loss = checkpoint['val_loss']
+        # If the resumed checkpoint was best, we should handle early stopping
+        print(f"Resumed at epoch {start_epoch}, best val loss so far: {best_val_loss:.4f}")
+
+    logger = MetricsLogger(LOGS_DIR, filename_prefix=exp_name)
+    # If resuming, we need to fill the logger with previous data? It will just append.
+    hyperparams = vars(args)
+    with open(os.path.join(save_dir, f'{exp_name}_hyperparameters.json'), 'w') as f:
+        json.dump(hyperparams, f, indent=2)
+
+    for epoch in range(start_epoch, args.epochs + 1):
         start_time = time.time()
         train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler, autocast_ctx, loss_fn)
         val_loss = validate(model, val_loader, device, loss_fn)
@@ -153,10 +170,11 @@ def main():
             'optimizer_state_dict': optimizer.state_dict(),
             'val_loss': val_loss,
         }
-        torch.save(ckpt, os.path.join(args.save_dir, f'{exp_name}_latest.pth'))
+        # Always save latest
+        torch.save(ckpt, latest_path)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(ckpt, os.path.join(args.save_dir, f'{exp_name}_best.pth'))
+            torch.save(ckpt, best_path)
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -168,7 +186,7 @@ def main():
     logger.close()
     print(f"Training finished. Best val {args.loss}: {best_val_loss:.4f}")
 
-    # Generate training curves after training
+    # Training curves
     try:
         from visualisations.training_curves import plot_training_curves
         csv_path = os.path.join(LOGS_DIR, f"{exp_name}_metrics.csv")

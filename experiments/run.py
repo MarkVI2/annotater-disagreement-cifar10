@@ -11,19 +11,17 @@ sys.path.insert(0, str(project_root))
 
 PROJECT_ROOT = project_root
 
-# Experiment grid: losses, heads, pretrained_type (ablation A/B/C)
 losses = ['kl', 'js', 'custom_composite', 'emd']
 heads = ['linear', 'mlp']
 pretrained_types = ['random', 'cifar10', 'imagenet']
 use_temperature = [False, True]
+INIT_TEMP = 2.0
 epochs = 60
 batch_size = 128
 lr = 1e-3
 weight_decay = 1e-4
 loss_beta = 0.5
 loss_epsilon = 0.1
-
-INIT_TEMP = 2.0
 
 all_configs = []
 for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, use_temperature):
@@ -54,30 +52,47 @@ def run_one(gpu_id, configs_for_gpu):
     env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
     for exp_name, cmd, save_dir in configs_for_gpu:
-        print(f"[GPU {gpu_id}] Running: {cmd}")
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        best_path = save_dir / (exp_name + '_best.pth')
+        latest_path = save_dir / (exp_name + '_latest.pth')
+
+        if best_path.exists():
+            print(f"[GPU {gpu_id}] {exp_name} already completed (best.pth found). Skipping.")
+            # Read best validation loss from existing log
+            log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
+            try:
+                with open(log_csv, 'r') as f:
+                    reader = csv.DictReader(f)
+                    val_losses = [float(row['val_loss']) for row in reader if 'val_loss' in row]
+                    best_val = min(val_losses) if val_losses else 999.0
+            except:
+                best_val = 999.0
+            print(f"[GPU {gpu_id}] {exp_name} best val loss = {best_val:.4f}")
+            continue
+
+        if latest_path.exists():
+            print(f"[GPU {gpu_id}] {exp_name} has incomplete run; resuming from latest checkpoint.")
+            cmd += " --resume"
+        else:
+            print(f"[GPU {gpu_id}] Starting fresh training for {exp_name}.")
+
+        full_cmd = cmd  # already includes --resume if needed
+        print(f"[GPU {gpu_id}] Running: {full_cmd}")
+        result = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, env=env)
+
         if result.returncode != 0:
             print(f"[GPU {gpu_id}] ERROR: Training failed for {exp_name}")
             print("STDOUT:\n", result.stdout)
             print("STDERR:\n", result.stderr)
-        else:
-            # Even if returncode 0, check log file
-            log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
-            if not log_csv.exists():
-                print(f"[GPU {gpu_id}] WARNING: log file not found for {exp_name} (stdout/stderr below)")
-                print("STDOUT:\n", result.stdout)
-                print("STDERR:\n", result.stderr)
 
-        # Read best validation loss from log (if exists)
+        # Read best val loss from log
+        log_csv = PROJECT_ROOT / 'outputs' / 'logs' / f'{exp_name}_metrics.csv'
         try:
             with open(log_csv, 'r') as f:
                 reader = csv.DictReader(f)
                 val_losses = [float(row['val_loss']) for row in reader if 'val_loss' in row]
                 best_val = min(val_losses) if val_losses else 999.0
-        except Exception as e:
+        except:
             best_val = 999.0
-            print(f"[GPU {gpu_id}] Could not read log for {exp_name}: {e}")
-
         print(f"[GPU {gpu_id}] {exp_name} best val loss = {best_val:.4f}")
 
 
@@ -107,7 +122,6 @@ def main():
             except:
                 pass
             loss, head = exp_name.split('_')[0], exp_name.split('_')[1]
-            # simple parse to get pretrained_type
             pt = exp_name.split('_')[3] if len(exp_name.split('_')) > 3 else 'unknown'
             temp = '_temp' in exp_name
             writer.writerow([exp_name, loss, head, pt, temp, best_val, str(save_dir)])
