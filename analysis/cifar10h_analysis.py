@@ -125,57 +125,58 @@ def plot_entropy_analysis(
 # =============================================================================
  
 def plot_distribution_comparison(
-    images: torch.Tensor,          # (N, 3, 32, 32) — raw test images (un-normalized)
-    true_probs: np.ndarray,         # (N, 10)
-    pred_probs: np.ndarray,         # (N, 10)
-    n_examples: int = 4,            # 4 is good for a report (2 low + 2 high)
+    images,                       # (N, 3, 32, 32) torch.Tensor or numpy — raw test images (un-normalized)
+    true_probs: np.ndarray,       # (N, 10)
+    pred_probs: np.ndarray,       # (N, 10)
+    n_examples: int = 4,          # 4 is good for a report (2 low + 2 high)
     save_path: str = "visualisations/distribution_comparison.png"
 ):
     """
     Selects n_examples//2 low-entropy and n_examples//2 high-entropy images.
     For each shows the image + side-by-side bar charts p(y|x) vs q(y|x).
- 
-    HOW MANY EXAMPLES FOR A GOOD REPORT:
-      - 4 total (2 low + 2 high) is the minimum readable layout.
-      - 6 (3 low + 3 high) gives richer evidence without crowding the page.
-      - We default to 4 for clean 2×4 grid layout.
- 
-    WHERE TO CALL:
-      After collect_test_predictions(). You need raw (un-normalized) images
-      so the visual makes sense. Keep a separate list during your test loop:
-        raw_images.append(inputs_unnorm.cpu())
     """
     H_true = compute_shannon_entropy(true_probs)
     half = n_examples // 2
- 
+
     # Pick examples
     sorted_idx = np.argsort(H_true)
     low_idx  = sorted_idx[:half]
     high_idx = sorted_idx[-half:]
     selected = list(low_idx) + list(high_idx)
     labels   = (["Low Entropy"] * half) + (["High Entropy"] * half)
- 
+
     fig, axes = plt.subplots(n_examples, 3, figsize=(10, 2.8 * n_examples))
     fig.suptitle("True vs Predicted Distributions (p vs q)", fontsize=13, y=1.01)
- 
+
     x_pos = np.arange(10)
     bar_width = 0.38
- 
+
     for row, (idx, label) in enumerate(zip(selected, labels)):
         img_ax  = axes[row, 0]
         bar_ax  = axes[row, 1]
         diff_ax = axes[row, 2]
- 
+
         # --- Image ---
-        img = images[idx].permute(1, 2, 0).numpy()
-        img = np.clip(img, 0, 1)
-        img_ax.imshow(img, interpolation="nearest")
+        img = images[idx]
+        # Convert to (H, W, 3) numpy array for imshow
+        if hasattr(img, 'permute'):                 # torch Tensor
+            img_np = img.permute(1, 2, 0).detach().cpu().numpy()
+        elif isinstance(img, np.ndarray):
+            if img.shape[0] == 3:                   # (3, H, W) -> (H, W, 3)
+                img_np = img.transpose(1, 2, 0)
+            else:
+                img_np = img
+        else:
+            img_np = np.asarray(img)
+        img_np = np.clip(img_np, 0, 1)
+
+        img_ax.imshow(img_np, interpolation="nearest")
         img_ax.set_title(
             f"{label}\nH_true={H_true[idx]:.2f} bits",
             fontsize=8
         )
         img_ax.axis("off")
- 
+
         # --- Bar chart ---
         p = true_probs[idx]
         q = pred_probs[idx]
@@ -189,7 +190,7 @@ def plot_distribution_comparison(
         bar_ax.set_title("Distribution p vs q", fontsize=8)
         bar_ax.legend(fontsize=7)
         bar_ax.set_ylim(0, 1.05)
- 
+
         # --- Difference plot ---
         diff = q - p
         colors = ["#4CAF50" if d >= 0 else "#F44336" for d in diff]
@@ -199,7 +200,7 @@ def plot_distribution_comparison(
         diff_ax.set_xticklabels(CIFAR10_CLASSES, rotation=45, ha="right", fontsize=7)
         diff_ax.set_ylabel("q − p")
         diff_ax.set_title("Prediction Error per Class", fontsize=8)
- 
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
