@@ -43,43 +43,12 @@ def find_best_checkpoints(checkpoint_dir="outputs/checkpoints"):
 
 def run_evaluation():
     print("\n" + "="*60)
-    print("STAGE 3: EVALUATION ON ALL BEST CHECKPOINTS")
+    print("STAGE 3: EVALUATION")
     print("="*60)
-    # Use the evaluation/eval.py logic to load and evaluate all checkpoints.
-    # We'll import the load_model + run_analysis functions directly.
-    sys.path.insert(0, os.path.abspath("."))
-    import torch
-    from evaluation.eval import load_model_from_ckpt, run_analysis
-    from data.pipeline import load_full_dataset, create_splits, create_dataloaders
-    from utils.device import get_device
-
-    device = get_device()
-    dataset = load_full_dataset()
-    splits = create_splits(dataset)
-    loaders = create_dataloaders(splits)
-    test_loader = loaders["test"]
-
-    best_ckpts = find_best_checkpoints()
-    if not best_ckpts:
-        print("No best checkpoints found. Did training complete?")
+    result = subprocess.run([sys.executable, "evaluation/eval.py"], capture_output=False)
+    if result.returncode != 0:
+        print("Evaluation failed.")
         sys.exit(1)
-
-    os.makedirs("outputs/eval", exist_ok=True)
-    for exp_name, ckpt_path in best_ckpts.items():
-        print(f"\n--- Evaluating {exp_name} ---")
-        # Determine head type and temperature from experiment name
-        head = "mlp" if "mlp" in exp_name else "linear"
-        use_temp = "_temp" in exp_name
-        model = load_model_from_ckpt(ckpt_path, device, head_type=head, use_temperature=use_temp)
-        output_dir = f"outputs/eval/{exp_name}"
-        run_analysis(model, test_loader, device, output_dir=output_dir)
-
-    # Optional: create a global metric comparison plot
-    from evaluation.visualize import plot_metrics_comparison
-    # collect metrics from saved files? For brevity, we skip automatic collection here;
-    # you can manually run the comparison after.
-
-    print("\nEvaluation complete. See outputs/eval/ for plots and metrics.")
 
 def main():
     parser = argparse.ArgumentParser(description="Full pipeline for CIFAR-10H disagreement project")

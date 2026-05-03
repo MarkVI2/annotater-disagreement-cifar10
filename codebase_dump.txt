@@ -1,67 +1,1400 @@
 ===== ./visualisations/grad_cam_plots.py =====
+"""
+visualisations/grad_cam_plots.py
+==================================
+Grad-CAM visualization helpers.
 
-===== ./visualisations/training_curves.py =====
+The GradCAM class lives in  explainability/grad_cam.py  (see below).
+This file contains the *plotting* functions that sit in the visualisations tab:
+    - overlay_grad_cam          : produce a single heatmap overlay image
+    - plot_grad_cam_grid        : grid of Grad-CAM panels for multiple images
+    - plot_entropy_vs_gradcam   : compare low vs high entropy CAM patterns
+
+Additionally, this file contains the complete GradCAM class so that your
+explainability/grad_cam.py  can simply do:
+    from visualisations.grad_cam_plots import GradCAM
+or you can copy the class there directly.
+
+WHERE TO CALL:
+    from visualisations.grad_cam_plots import GradCAM, plot_grad_cam_grid
+    grad_cam = GradCAM(model, target_layer=model.layer4[-1])
+    plot_grad_cam_grid(grad_cam, test_images, true_probs, pred_probs,
+                       n_low=3, n_high=3)
+"""
+
 import os
-import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import cv2               # pip install opencv-python-headless
 
-def plot_training_curves(log_dir, exp_name):
+os.makedirs("outputs/explainability", exist_ok=True)
+
+CIFAR10_CLASSES = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog",      "frog",       "horse","ship","truck",
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  GradCAM class  (also lives here so visualisations/ is self-contained)
+# ═══════════════════════════════════════════════════════════════════════════════
+class GradCAM:
     """
-    Reads the metrics CSV from log_dir/{exp_name}_metrics.csv and saves
-    training/validation loss curves + validation KL (or primary loss) curve.
+    Grad-CAM for soft-label distribution models (ResNet / EfficientNet).
+
+    Strategies for choosing the target class in a distribution model:
+        "top_pred"        → gradient w.r.t. argmax q(y|x)   — most confident class
+        "top_true"        → gradient w.r.t. argmax p(y|x)   — ground-truth dominant
+        "entropy_weighted"→ weighted sum of class CAMs by –p·log(p)
+
+    USAGE:
+        grad_cam = GradCAM(model, target_layer=model.layer4[-1])   # ResNet-18
+        # EfficientNet: model.features[-1]
+        cam = grad_cam.generate(image_tensor)       # (H, W) in [0, 1]
+        overlay = grad_cam.overlay(raw_image_np, cam)
     """
-    csv_path = os.path.join(log_dir, f'{exp_name}_metrics.csv')
-    if not os.path.exists(csv_path):
-        print(f"No log file found at {csv_path}, skipping training curves.")
-        return
 
-    df = pd.read_csv(csv_path)
-    epochs = df['epoch']
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle(f'Training Curves: {exp_name}')
+    def __init__(self, model: nn.Module, target_layer: nn.Module):
+        self.model        = model
+        self.target_layer = target_layer
+        self._gradients   = None
+        self._activations = None
+        self._hooks: list = []
+        self._register_hooks()
 
-    # Loss curves
-    ax1.plot(epochs, df['train_loss'], label='Train Loss', color='#2196F3', linewidth=2)
-    ax1.plot(epochs, df['val_loss'], label='Val Loss', color='#FF5722', linestyle='--', linewidth=2)
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Train vs Validation Loss')
-    ax1.legend()
-    ax1.grid(alpha=0.3)
+    def _register_hooks(self):
+        def fwd_hook(module, input, output):
+            self._activations = output.detach()
 
-    # Validation loss (which for KL is KL divergence)
-    ax2.plot(epochs, df['val_loss'], color='#4CAF50', linewidth=2)
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Validation Loss')
-    ax2.set_title('Validation Loss over Epochs')
-    ax2.grid(alpha=0.3)
+        def bwd_hook(module, grad_in, grad_out):
+            self._gradients = grad_out[0].detach()
+
+        self._hooks.append(
+            self.target_layer.register_forward_hook(fwd_hook)
+        )
+        self._hooks.append(
+            self.target_layer.register_full_backward_hook(bwd_hook)
+        )
+
+    def remove_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    def generate(
+        self,
+        image: torch.Tensor,             # (1, 3, H, W) — normalized
+        target_class: int | None = None,
+        strategy: str = "top_pred",      # "top_pred" | "top_true" | "entropy_weighted"
+        true_probs: torch.Tensor | None = None,   # needed for "top_true" / "entropy_weighted"
+    ) -> np.ndarray:
+        """
+        Returns a (H, W) heatmap array, values in [0, 1].
+        """
+        self.model.eval()
+        image = image.clone().requires_grad_(True)
+
+        # Forward
+        logits = self.model(image)          # (1, 10) — already softmax'd
+        probs  = logits                     # model outputs probabilities
+
+        # Pick target class
+        if strategy == "top_pred" or target_class is not None:
+            cls = target_class if target_class is not None else int(probs.argmax(dim=1))
+            score = probs[0, cls]
+            self.model.zero_grad()
+            score.backward(retain_graph=True)
+            cam = self._cam_from_grads()
+
+        elif strategy == "top_true":
+            assert true_probs is not None, "Pass true_probs for strategy='top_true'"
+            cls   = int(true_probs.argmax())
+            score = probs[0, cls]
+            self.model.zero_grad()
+            score.backward(retain_graph=True)
+            cam = self._cam_from_grads()
+
+        elif strategy == "entropy_weighted":
+            # Σ_y  –p(y)·log(p(y))  *  ∂logit_y/∂A
+            p   = probs[0].detach()
+            eps = 1e-12
+            weights = -(p * (p + eps).log())          # (10,)
+            cam = np.zeros(
+                (self._activations.shape[-2], self._activations.shape[-1]),
+                dtype=np.float32,
+            )
+            for cls_i in range(10):
+                self.model.zero_grad()
+                probs[0, cls_i].backward(retain_graph=True)
+                cam += weights[cls_i].item() * self._cam_from_grads()
+            cam = np.clip(cam, 0, None)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy!r}")
+
+        return cam
+
+    def _cam_from_grads(self) -> np.ndarray:
+        """Global-average-pool gradients → weighted activation sum → ReLU → normalize."""
+        grads = self._gradients[0]       # (C, H, W)
+        acts  = self._activations[0]     # (C, H, W)
+        alpha = grads.mean(dim=(1, 2))   # (C,)
+        cam   = (alpha[:, None, None] * acts).sum(dim=0)
+        cam   = F.relu(cam).cpu().numpy()
+        if cam.max() > 0:
+            cam = cam / cam.max()
+        return cam.astype(np.float32)
+
+    @staticmethod
+    def overlay(
+        raw_image: np.ndarray,      # (H, W, 3)  uint8 or float [0,1]
+        cam: np.ndarray,            # (h, w) [0,1]
+        alpha: float = 0.45,
+        colormap: int = cv2.COLORMAP_JET,
+    ) -> np.ndarray:
+        """
+        Returns (H, W, 3) uint8 with the heatmap overlaid on the raw image.
+        """
+        if raw_image.dtype != np.uint8:
+            raw_image = (np.clip(raw_image, 0, 1) * 255).astype(np.uint8)
+
+        h, w = raw_image.shape[:2]
+        cam_resized = cv2.resize(cam, (w, h))
+        heatmap_u8  = (cam_resized * 255).astype(np.uint8)
+        heatmap_rgb = cv2.applyColorMap(heatmap_u8, colormap)
+        heatmap_rgb = cv2.cvtColor(heatmap_rgb, cv2.COLOR_BGR2RGB)
+
+        blended = (alpha * heatmap_rgb + (1 - alpha) * raw_image).clip(0, 255).astype(np.uint8)
+        return blended
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Plotting helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def overlay_grad_cam(
+    raw_image: np.ndarray,
+    cam: np.ndarray,
+    title: str = "",
+    save_path: str | None = None,
+) -> np.ndarray:
+    """
+    Show (and optionally save) a single Grad-CAM overlay.
+    Returns the overlay array.
+    """
+    overlay = GradCAM.overlay(raw_image, cam)
+    if save_path or title:
+        fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+        axes[0].imshow(np.clip(raw_image / 255.0
+                               if raw_image.max() > 1 else raw_image, 0, 1))
+        axes[0].set_title("Original", fontsize=9);  axes[0].axis("off")
+        axes[1].imshow(cam, cmap="jet");  axes[1].set_title("CAM heatmap", fontsize=9); axes[1].axis("off")
+        axes[2].imshow(overlay);          axes[2].set_title("Overlay", fontsize=9);      axes[2].axis("off")
+        if title:
+            fig.suptitle(title, fontsize=10)
+        plt.tight_layout()
+        if save_path:
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            print(f"[grad_cam_plots] Saved → {save_path}")
+        plt.close()
+    return overlay
+
+
+def plot_grad_cam_grid(
+    grad_cam: GradCAM,
+    images: torch.Tensor,       # (N, 3, 32, 32)  normalized
+    true_probs: torch.Tensor,   # (N, 10)
+    pred_probs: torch.Tensor,   # (N, 10)
+    n_low: int = 3,
+    n_high: int = 3,
+    strategy: str = "top_pred",
+    save_path: str = "outputs/explainability/grad_cam_grid.png",
+) -> None:
+    """
+    Grid layout:
+        rows = selected images (n_low low-entropy + n_high high-entropy)
+        cols = [original | Grad-CAM | overlay | bar chart p vs q]
+
+    WHERE TO CALL:
+        After load_model() + run_inference():
+            from visualisations.grad_cam_plots import GradCAM, plot_grad_cam_grid
+            gc = GradCAM(model, model.layer4[-1])
+            plot_grad_cam_grid(gc, test_images, true_p, pred_q)
+    """
+    from evaluation.metrics import compute_entropy as _cE
+    import torch as _torch
+
+    # Pick images
+    H      = _cE(true_probs).numpy()
+    sort_i = np.argsort(H)
+    lo_idx = list(sort_i[:n_low])
+    hi_idx = list(sort_i[-n_high:])
+    sel    = lo_idx + hi_idx
+    tags   = [f"Low  H={H[i]:.2f}" for i in lo_idx] + \
+             [f"High H={H[i]:.2f}" for i in hi_idx]
+
+    n_rows = len(sel)
+    fig, axes = plt.subplots(n_rows, 4, figsize=(13, 3.2 * n_rows))
+    fig.suptitle(f"Grad-CAM Analysis  (strategy={strategy})", fontsize=12)
+
+    x_pos  = np.arange(10)
+    bwidth = 0.38
+
+    for row, (idx, tag) in enumerate(zip(sel, tags)):
+        img_t  = images[idx:idx+1]        # (1, 3, 32, 32)
+        tp     = true_probs[idx]
+        qp     = pred_probs[idx]
+
+        # Grad-CAM
+        cam = grad_cam.generate(
+            img_t, strategy=strategy,
+            true_probs=tp if "true" in strategy else None
+        )
+
+        # Un-normalise for display  (undo CIFAR-10 mean/std)
+        MEAN = _torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
+        STD  = _torch.tensor([0.2023, 0.1994, 0.2010]).view(3, 1, 1)
+        raw  = (img_t[0].cpu() * STD + MEAN).clamp(0, 1).permute(1, 2, 0).numpy()
+        raw_u8 = (raw * 255).astype(np.uint8)
+        overlay = GradCAM.overlay(raw_u8, cam)
+
+        row_axes = axes[row] if n_rows > 1 else axes
+
+        # Col 0: original
+        row_axes[0].imshow(raw)
+        row_axes[0].set_title(tag, fontsize=8)
+        row_axes[0].axis("off")
+
+        # Col 1: heatmap
+        row_axes[1].imshow(cam, cmap="jet")
+        row_axes[1].set_title("CAM heatmap", fontsize=8)
+        row_axes[1].axis("off")
+
+        # Col 2: overlay
+        row_axes[2].imshow(overlay)
+        row_axes[2].set_title("Overlay", fontsize=8)
+        row_axes[2].axis("off")
+
+        # Col 3: p vs q bar chart
+        p_np = tp.numpy() if isinstance(tp, _torch.Tensor) else tp
+        q_np = qp.numpy() if isinstance(qp, _torch.Tensor) else qp
+        row_axes[3].bar(x_pos - bwidth/2, p_np, bwidth, color="#2196F3", alpha=0.85, label="p true")
+        row_axes[3].bar(x_pos + bwidth/2, q_np, bwidth, color="#FF5722", alpha=0.85, label="q pred")
+        row_axes[3].set_xticks(x_pos)
+        row_axes[3].set_xticklabels([c[:3] for c in CIFAR10_CLASSES],
+                                     rotation=45, ha="right", fontsize=6)
+        row_axes[3].set_ylim(0, 1.05)
+        row_axes[3].legend(fontsize=6)
+        row_axes[3].set_title("p vs q", fontsize=8)
 
     plt.tight_layout()
-    os.makedirs('outputs/plots', exist_ok=True)
-    save_path = os.path.join('outputs/plots', f'{exp_name}_training_curves.png')
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"Training curves saved to {save_path}")
+    print(f"[grad_cam_plots] Saved → {save_path}")
+
+
+def plot_entropy_vs_gradcam(
+    grad_cam: GradCAM,
+    images: torch.Tensor,
+    true_probs: torch.Tensor,
+    pred_probs: torch.Tensor,
+    strategy: str = "entropy_weighted",
+    n_per_group: int = 4,
+    save_path: str = "outputs/explainability/entropy_vs_gradcam.png",
+) -> None:
+    """
+    Two-row comparison: top row = low-entropy images with their CAMs,
+    bottom row = high-entropy images. Demonstrates that diffuse CAMs
+    correlate with high annotator disagreement.
+
+    WHERE TO CALL: same as plot_grad_cam_grid.
+    """
+    from evaluation.metrics import compute_entropy as _cE
+    import torch as _torch
+
+    H      = _cE(true_probs).numpy()
+    sort_i = np.argsort(H)
+    lo_idx = list(sort_i[:n_per_group])
+    hi_idx = list(sort_i[-n_per_group:])
+
+    MEAN = _torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
+    STD  = _torch.tensor([0.2023, 0.1994, 0.2010]).view(3, 1, 1)
+
+    fig, axes = plt.subplots(4, n_per_group, figsize=(3 * n_per_group, 11))
+    fig.suptitle(
+        f"Grad-CAM vs Entropy  (strategy={strategy})\n"
+        "Top rows: low disagreement → focused attention | Bottom rows: high disagreement → diffuse",
+        fontsize=10,
+    )
+    row_labels = ["Low Entropy\nImage", "Low Entropy\nCAM Overlay",
+                  "High Entropy\nImage", "High Entropy\nCAM Overlay"]
+
+    for col, (lo, hi) in enumerate(zip(lo_idx, hi_idx)):
+        for grp_i, idx in enumerate([lo, hi]):
+            img_t = images[idx:idx+1]
+            cam   = grad_cam.generate(
+                img_t, strategy=strategy,
+                true_probs=true_probs[idx] if "true" in strategy or "entropy" in strategy else None,
+            )
+            raw   = (img_t[0].cpu() * STD + MEAN).clamp(0, 1).permute(1, 2, 0).numpy()
+            raw_u8 = (raw * 255).astype(np.uint8)
+            ov    = GradCAM.overlay(raw_u8, cam)
+
+            axes[grp_i * 2,     col].imshow(raw)
+            axes[grp_i * 2,     col].set_title(f"H={H[idx]:.2f}", fontsize=8)
+            axes[grp_i * 2,     col].axis("off")
+            axes[grp_i * 2 + 1, col].imshow(ov)
+            axes[grp_i * 2 + 1, col].axis("off")
+
+    for row_i, lbl in enumerate(row_labels):
+        axes[row_i, 0].set_ylabel(lbl, fontsize=9, fontweight="bold")
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[grad_cam_plots] Saved → {save_path}")
+
+===== ./visualisations/training_curves.py =====
+"""
+visualisations/training_curves.py
+===================================
+Plots training and validation loss curves from the MetricsLogger CSV files.
+
+WHERE TO CALL:
+    After training finishes (end of training/train.py main(), or in a notebook).
+    Example:
+        from visualisations.training_curves import plot_training_curves, plot_all_runs
+        plot_training_curves("outputs/logs/kl_linear_metrics.csv", label="KL Linear")
+        plot_all_runs("outputs/logs/")   # overlays all runs on one figure
+"""
+
+import os
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
+
+# ─────────────────────────────────────────────
+# 1. Single-run plot  (train loss + val loss)
+# ─────────────────────────────────────────────
+def plot_training_curves(
+    csv_path: str,
+    label: str = "",
+    save_path: str | None = None,
+) -> None:
+    """
+    Plot train_loss and val_loss from a MetricsLogger CSV file.
+
+    Args:
+        csv_path  : path to the CSV produced by MetricsLogger
+        label     : experiment name shown in the title
+        save_path : where to save the PNG; if None, derives from csv_path
+    """
+    import csv
+
+    epochs, train_losses, val_losses = [], [], []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            epochs.append(int(row["epoch"]))
+            train_losses.append(float(row["train_loss"]))
+            val_losses.append(float(row["val_loss"]))
+
+    epochs      = np.array(epochs)
+    train_losses = np.array(train_losses)
+    val_losses   = np.array(val_losses)
+
+    best_epoch = epochs[np.argmin(val_losses)]
+    best_val   = val_losses.min()
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.plot(epochs, train_losses, color="#2196F3", linewidth=1.8, label="Train loss")
+    ax.plot(epochs, val_losses,   color="#FF5722", linewidth=1.8, label="Val loss")
+    ax.axvline(best_epoch, color="gray", linestyle="--", linewidth=1,
+               label=f"Best val @ epoch {best_epoch}  ({best_val:.4f})")
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title(f"Training & Validation Loss{f'  ({label})' if label else ''}")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+
+    if save_path is None:
+        base = os.path.splitext(csv_path)[0]
+        save_path = base + "_curves.png"
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[training_curves] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────
+# 2. Multi-run overlay (all experiments together)
+# ─────────────────────────────────────────────
+def plot_all_runs(
+    logs_dir: str = "outputs/logs",
+    save_path: str = "outputs/plots/all_val_curves.png",
+) -> None:
+    """
+    Overlay validation loss curves for every CSV in logs_dir on a single figure.
+    Useful for comparing KL / JS / Custom / EMD experiments at a glance.
+
+    Args:
+        logs_dir  : directory containing MetricsLogger CSVs
+        save_path : output PNG path
+    """
+    import csv
+
+    csv_files = sorted(glob.glob(os.path.join(logs_dir, "*.csv")))
+    if not csv_files:
+        print(f"[training_curves] No CSV files found in {logs_dir}")
+        return
+
+    colors = cm.tab10(np.linspace(0, 1, len(csv_files)))
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for csv_path, color in zip(csv_files, colors):
+        label = os.path.splitext(os.path.basename(csv_path))[0]
+        label = label.replace("_metrics", "")      # strip suffix added by MetricsLogger
+
+        epochs, val_losses = [], []
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                epochs.append(int(row["epoch"]))
+                val_losses.append(float(row["val_loss"]))
+
+        ax.plot(epochs, val_losses, color=color, linewidth=1.8, label=label)
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Validation Loss")
+    ax.set_title("Validation Loss — All Experiments")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[training_curves] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────
+# 3. Metric curve over epochs (e.g. Pearson r)
+# ─────────────────────────────────────────────
+def plot_metric_curve(
+    epochs: list[int],
+    values: list[float],
+    metric_name: str = "Pearson r",
+    label: str = "",
+    save_path: str = "outputs/plots/metric_curve.png",
+) -> None:
+    """
+    Plot any scalar metric tracked per-epoch during validation.
+
+    WHERE TO CALL:
+        If you compute e.g. Pearson r on val set each epoch in train.py,
+        collect it in a list and call this at the end of training.
+
+        from visualisations.training_curves import plot_metric_curve
+        plot_metric_curve(epoch_list, pearson_list, metric_name="Pearson r (val)",
+                          label="KL Linear", save_path="outputs/plots/pearson_kl_linear.png")
+    """
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(epochs, values, color="#4CAF50", linewidth=1.8, label=metric_name)
+    ax.axhline(max(values), color="gray", linestyle="--", linewidth=0.8,
+               label=f"Best = {max(values):.4f}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(metric_name)
+    ax.set_title(f"{metric_name} over Training{f'  ({label})' if label else ''}")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[training_curves] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────
+# Quick self-test with dummy data
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    import tempfile, csv, os
+
+    # Create a dummy CSV to test single-run plot
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
+                                     delete=False, newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss"])
+        writer.writeheader()
+        for ep in range(1, 31):
+            writer.writerow({
+                "epoch":      ep,
+                "train_loss": 0.9 * np.exp(-ep / 15) + np.random.uniform(0, 0.02),
+                "val_loss":   0.95 * np.exp(-ep / 15) + np.random.uniform(0, 0.03),
+            })
+        tmp = f.name
+
+    os.makedirs("outputs/plots", exist_ok=True)
+    plot_training_curves(tmp, label="Dummy KL Linear",
+                         save_path="outputs/plots/test_training_curves.png")
+    plot_metric_curve(
+        list(range(1, 31)),
+        [0.3 + 0.5 * (1 - np.exp(-i / 10)) + np.random.uniform(0, 0.02) for i in range(30)],
+        metric_name="Pearson r (val)",
+        label="Dummy",
+        save_path="outputs/plots/test_metric_curve.png",
+    )
+    print("Self-test complete — check outputs/plots/")
+    os.unlink(tmp)
+
+
 ===== ./visualisations/data_plots.py =====
+"""
+visualisations/data_plots.py
+==============================
+Thin wrappers that re-export the four required data-stage plots so your
+team can call them from this tab without touching data/visualization.py.
+
+Also adds one extra: side-by-side true vs predicted entropy histogram,
+which belongs to the visualization tab (not just the data tab).
+
+WHERE TO CALL:
+    from visualisations.data_plots import (
+        plot_entropy_histogram,
+        plot_class_entropy_bar,
+        plot_annotator_confusion_matrix,
+        plot_extreme_examples,
+        plot_entropy_comparison,
+    )
+
+    # After main_data.py has run:
+    generate_all_data_visualizations(dataset, statistics, save_dir="outputs/plots")
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ─── re-export the four canonical data plots ─────────────────────────────────
+from data.visualization import (
+    plot_entropy_histogram,
+    plot_class_entropy_bar,
+    plot_annotator_confusion_matrix,
+    plot_extreme_examples,
+    generate_all_data_visualizations,
+)
+
+__all__ = [
+    "plot_entropy_histogram",
+    "plot_class_entropy_bar",
+    "plot_annotator_confusion_matrix",
+    "plot_extreme_examples",
+    "generate_all_data_visualizations",
+    "plot_entropy_comparison",
+    "plot_soft_label_overview",
+]
+
+CIFAR10_CLASSES = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog", "frog", "horse", "ship", "truck",
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extra: True vs Predicted entropy histogram side-by-side
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_entropy_comparison(
+    true_entropies: np.ndarray,
+    pred_entropies: np.ndarray,
+    save_path: str = "outputs/plots/entropy_comparison.png",
+) -> None:
+    """
+    Side-by-side histograms of true and predicted entropy.
+
+    WHERE TO CALL:
+        After running evaluation on the test set.
+        true_entropies / pred_entropies are (N,) numpy arrays.
+
+        from visualisations.data_plots import plot_entropy_comparison
+        plot_entropy_comparison(H_true, H_pred)
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+    fig.suptitle("Shannon Entropy Distribution: True vs Predicted", fontsize=13)
+
+    for ax, vals, color, title in zip(
+        axes,
+        [true_entropies, pred_entropies],
+        ["#2196F3", "#FF5722"],
+        ["True Entropy  H(p)", "Predicted Entropy  H(q)"],
+    ):
+        ax.hist(vals, bins=50, color=color, edgecolor="white", linewidth=0.4, alpha=0.85)
+        ax.axvline(vals.mean(), color="black", linestyle="--", linewidth=1.2,
+                   label=f"mean = {vals.mean():.3f}")
+        ax.axvline(np.log2(10), color="gray", linestyle=":", linewidth=1,
+                   label=f"max = {np.log2(10):.3f}")
+        ax.set_xlabel("Shannon Entropy (bits)")
+        ax.set_ylabel("Count")
+        ax.set_title(title)
+        ax.legend(fontsize=9)
+        ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[data_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extra: Soft-label distribution overview for a sample of images
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_soft_label_overview(
+    soft_labels: np.ndarray,
+    n_samples: int = 12,
+    save_path: str = "outputs/plots/soft_label_overview.png",
+    seed: int = 42,
+) -> None:
+    """
+    Show bar-chart soft labels for n_samples randomly chosen images.
+    Useful as a sanity-check panel in the report.
+
+    WHERE TO CALL:
+        dataset = load_full_dataset()
+        soft = np.stack([dataset[i][1].numpy() for i in range(len(dataset))])
+        plot_soft_label_overview(soft)
+    """
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(soft_labels), size=n_samples, replace=False)
+
+    cols = 4
+    rows = (n_samples + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.2, rows * 2.6))
+    axes = axes.flatten()
+
+    for ax_i, idx in enumerate(indices):
+        sl = soft_labels[idx]
+        dominant = int(np.argmax(sl))
+        ax = axes[ax_i]
+        colors = ["#FF5722" if j == dominant else "#90CAF9" for j in range(10)]
+        ax.bar(range(10), sl, color=colors, edgecolor="white")
+        ax.set_xticks(range(10))
+        ax.set_xticklabels(
+            [c[:3] for c in CIFAR10_CLASSES], rotation=45, ha="right", fontsize=7
+        )
+        ax.set_ylim(0, 1.05)
+        ax.set_title(f"#{idx} — {CIFAR10_CLASSES[dominant]}", fontsize=8)
+        ax.set_ylabel("p", fontsize=8)
+
+    # Hide unused axes
+    for ax in axes[len(indices):]:
+        ax.axis("off")
+
+    fig.suptitle("Soft Label Overview (random sample)", fontsize=12)
+    plt.tight_layout()
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[data_plots] Saved → {save_path}")
 
 ===== ./visualisations/model_diagram.py =====
-import torch
-from models.cifar_resnet import build_soft_label_model
-from torchviz import make_dot
+"""
+visualisations/model_diagram.py
+=================================
+Generates an architecture diagram (matplotlib, no external tools needed)
+and a parameter-count summary table.
 
-# Generate and save a diagram of the model
-model = build_soft_label_model(head_type='linear', pretrained_type='random')
-x = torch.randn(1, 3, 32, 32)
-dot = make_dot(model(x), params=dict(model.named_parameters()))
-dot.render('model_diagram', format='png', cleanup=True)
-print("Model diagram saved as model_diagram.png")
+Functions:
+    draw_architecture_diagram   – block-diagram PNG of backbone → head → output
+    print_model_summary         – pretty-print + PNG table of param counts
 
-# Parameter count
-total_params = sum(p.numel() for p in model.parameters())
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total parameters: {total_params:,}")
-print(f"Trainable parameters: {trainable_params:,}")
+WHERE TO CALL:
+    from visualisations.model_diagram import (
+        draw_architecture_diagram, print_model_summary
+    )
+    draw_architecture_diagram(save_path="outputs/plots/architecture.png")
+    print_model_summary(model, save_path="outputs/plots/param_table.png")
+"""
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
+
+
+os.makedirs("outputs/plots", exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Architecture block diagram
+# ─────────────────────────────────────────────────────────────────────────────
+def draw_architecture_diagram(
+    head_type: str = "mlp",
+    save_path: str = "outputs/plots/architecture.png",
+) -> None:
+    """
+    Draw a clear block diagram:
+        [Input 32×32 RGB] → [ResNet-18 Backbone] → [Global Avg Pool]
+        → [Linear / MLP head] → [Softmax] → [10-d distribution q(y|x)]
+
+    Args:
+        head_type : "linear" or "mlp"
+        save_path : output PNG
+    """
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.set_xlim(0, 14)
+    ax.set_ylim(0, 4)
+    ax.axis("off")
+    ax.set_facecolor("#FAFAFA")
+    fig.patch.set_facecolor("#FAFAFA")
+
+    # ── Blocks: (x_center, y_center, width, height, label, sub, color)
+    blocks = [
+        (1.1,  2.0, 1.6, 1.2, "Input",          "32×32 RGB",          "#90CAF9"),
+        (3.2,  2.0, 2.0, 1.2, "ResNet-18",       "Backbone\n(pretrained)",   "#64B5F6"),
+        (5.7,  2.0, 1.8, 1.2, "Global\nAvg Pool","512-d feature",      "#42A5F5"),
+        (8.1,  2.0, 2.0, 1.2,
+         "MLP Head" if head_type == "mlp" else "Linear Head",
+         "512→256→10\n(ReLU + Dropout)" if head_type == "mlp" else "512→10",
+         "#1E88E5"),
+        (10.5, 2.0, 1.6, 1.2, "Softmax",         "Temperature τ",      "#1565C0"),
+        (12.7, 2.0, 1.8, 1.2, "Output",          "q(y|x) ∈ Δ¹⁰",      "#FF8F00"),
+    ]
+
+    for (cx, cy, w, h, title, sub, color) in blocks:
+        rect = FancyBboxPatch(
+            (cx - w / 2, cy - h / 2), w, h,
+            boxstyle="round,pad=0.08", linewidth=1.5,
+            edgecolor="#333", facecolor=color, alpha=0.88,
+        )
+        ax.add_patch(rect)
+        ax.text(cx, cy + 0.12, title, ha="center", va="center",
+                fontsize=9, fontweight="bold", color="white")
+        ax.text(cx, cy - 0.22, sub, ha="center", va="center",
+                fontsize=7, color="white", alpha=0.9)
+
+    # ── Arrows between blocks
+    arrow_style = dict(
+        arrowstyle="->", color="#555", lw=1.6,
+        connectionstyle="arc3,rad=0.0",
+    )
+    xs = [b[0] for b in blocks]
+    for i in range(len(xs) - 1):
+        x0 = xs[i]  + blocks[i][2]  / 2
+        x1 = xs[i+1] - blocks[i+1][2] / 2
+        ax.annotate("", xy=(x1, 2.0), xytext=(x0, 2.0),
+                    arrowprops=arrow_style)
+
+    # ── Loss label below
+    ax.text(7.0, 0.5,
+            "Training target: KL / JSD / Custom (KL + entropy error) / EMD  →  minimize divergence from  p(y|x)",
+            ha="center", va="center", fontsize=8, color="#444",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="#FFF9C4", edgecolor="#FBC02D"))
+
+    ax.set_title(
+        f"Model Architecture — ResNet-18 Backbone + {'MLP' if head_type == 'mlp' else 'Linear'} Head",
+        fontsize=11, pad=10,
+    )
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[model_diagram] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Parameter-count summary table
+# ─────────────────────────────────────────────────────────────────────────────
+def print_model_summary(
+    model=None,
+    save_path: str = "outputs/plots/param_table.png",
+    extra_rows: list[dict] | None = None,
+) -> None:
+    """
+    Print a param-count table to console and save as a PNG.
+
+    Args:
+        model      : a PyTorch nn.Module; if None, uses hard-coded typical values
+        save_path  : output PNG
+        extra_rows : list of dicts { "Model": ..., "Backbone": ...,
+                                     "Head": ..., "Total Params": ..., "Trainable": ... }
+                     to append (for comparing variants without loading each model).
+
+    WHERE TO CALL:
+        from models.cifar_resnet import build_soft_label_model
+        m = build_soft_label_model(head_type="mlp", pretrained=True)
+        print_model_summary(m, extra_rows=[
+            {"Model": "ResNet-18 Linear", "Backbone": "11.17M",
+             "Head": "5.12K", "Total Params": "11.18M", "Trainable": "11.18M"},
+        ])
+    """
+    rows = []
+
+    if model is not None:
+        import torch
+        total   = sum(p.numel() for p in model.parameters())
+        trained = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        rows.append({
+            "Model":        "Current model",
+            "Total Params": f"{total / 1e6:.3f}M",
+            "Trainable":    f"{trained / 1e6:.3f}M",
+        })
+
+    # Typical ResNet-18 values for the report
+    if not rows and extra_rows is None:
+        rows = [
+            {"Model": "ResNet-18 + Linear head",  "Backbone": "11.17 M", "Head": "5.1 K",  "Total": "11.18 M", "Trainable": "11.18 M"},
+            {"Model": "ResNet-18 + MLP head",      "Backbone": "11.17 M", "Head": "132.9 K","Total": "11.30 M", "Trainable": "11.30 M"},
+            {"Model": "ResNet-18 (frozen bb) + MLP","Backbone": "11.17 M", "Head": "132.9 K","Total": "11.30 M", "Trainable": "132.9 K"},
+        ]
+
+    if extra_rows:
+        rows.extend(extra_rows)
+
+    # Console print
+    if rows:
+        keys = list(rows[0].keys())
+        col_widths = {k: max(len(k), max(len(str(r.get(k, ""))) for r in rows)) for k in keys}
+        header = "  ".join(k.ljust(col_widths[k]) for k in keys)
+        print("\n" + "=" * len(header))
+        print(header)
+        print("-" * len(header))
+        for r in rows:
+            print("  ".join(str(r.get(k, "")).ljust(col_widths[k]) for k in keys))
+        print("=" * len(header) + "\n")
+
+    # PNG table
+    col_labels = list(rows[0].keys()) if rows else []
+    cell_text  = [[str(r.get(k, "")) for k in col_labels] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(col_labels) * 2), len(rows) * 0.6 + 1.2))
+    ax.axis("off")
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        cellLoc="center",
+        loc="center",
+        colColours=["#1E88E5"] * len(col_labels),
+    )
+    for (row_i, col_i), cell in table.get_celld().items():
+        if row_i == 0:
+            cell.set_text_props(color="white", fontweight="bold")
+        cell.set_fontsize(9)
+    table.auto_set_font_size(False)
+    table.scale(1, 1.6)
+    ax.set_title("Model Parameter Summary", fontsize=11, pad=14)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[model_diagram] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quick self-test
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    draw_architecture_diagram(head_type="mlp",
+                               save_path="outputs/plots/arch_mlp.png")
+    draw_architecture_diagram(head_type="linear",
+                               save_path="outputs/plots/arch_linear.png")
+    print_model_summary(save_path="outputs/plots/param_table.png")
+    print("Self-test complete — check outputs/plots/")
+
 ===== ./visualisations/eval_plots.py =====
+"""
+visualisations/eval_plots.py
+==============================
+All post-training evaluation visualizations.
+
+Functions:
+    plot_entropy_scatter          – true vs predicted entropy scatter
+    plot_metrics_comparison_bar   – grouped bar chart across loss functions
+    plot_metrics_table            – print-ready table + PNG heatmap
+    plot_distribution_examples    – per-image p vs q bar charts
+    plot_precision_at_k           – Precision@K for K=100,200,500
+    plot_per_class_kl             – per-class KL breakdown
+    plot_robustness_curves        – OOD noise / annotator subsampling
+
+WHERE TO CALL:
+    All functions accept numpy arrays or torch tensors (N, 10).
+    Typical call site: evaluation/eval.py — after run_inference() returns.
+
+    from visualisations.eval_plots import (
+        plot_entropy_scatter, plot_metrics_comparison_bar,
+        plot_distribution_examples, plot_precision_at_k,
+        plot_per_class_kl, plot_robustness_curves,
+    )
+"""
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import torch
+from scipy.stats import pearsonr, spearmanr
+
+os.makedirs("outputs/eval", exist_ok=True)
+
+CIFAR10_CLASSES = [
+    "airplane", "automobile", "bird", "cat", "deer",
+    "dog",      "frog",       "horse","ship","truck",
+]
+
+
+def _to_numpy(x):
+    """Accept torch.Tensor or np.ndarray, return np.ndarray."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _entropy(probs: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    p = np.clip(probs, eps, 1.0)
+    return -np.sum(p * np.log2(p), axis=1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Entropy scatter  (required: Section 6.1 Metric 2)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_entropy_scatter(
+    true_p,
+    pred_q,
+    label: str = "",
+    save_path: str = "outputs/eval/entropy_scatter.png",
+) -> None:
+    """
+    Scatter plot of true vs predicted entropy with Pearson/Spearman annotations.
+
+    WHERE TO CALL:
+        plot_entropy_scatter(true_p, pred_q, label="KL Linear")
+    """
+    p, q   = _to_numpy(true_p), _to_numpy(pred_q)
+    H_true = _entropy(p)
+    H_pred = _entropy(q)
+    r_p, _ = pearsonr(H_true, H_pred)
+    r_s, _ = spearmanr(H_true, H_pred)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.scatter(H_true, H_pred, alpha=0.25, s=7, color="steelblue", label="Test images")
+    lim = max(H_true.max(), H_pred.max()) * 1.05
+    ax.plot([0, lim], [0, lim], "r--", linewidth=1.2, label="Perfect prediction")
+    ax.set_xlabel("True Entropy H(p)  [bits]")
+    ax.set_ylabel("Predicted Entropy H(q)  [bits]")
+    ax.set_title(
+        f"True vs Predicted Entropy{f'  ({label})' if label else ''}\n"
+        f"Pearson r = {r_p:.3f}   Spearman ρ = {r_s:.3f}"
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Grouped bar chart across loss functions  (required: Section 6.1 Metric 4)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_metrics_comparison_bar(
+    results_dict: dict,
+    metrics_to_show: list[str] | None = None,
+    save_path: str = "outputs/eval/metrics_comparison.png",
+) -> None:
+    """
+    Grouped bar chart comparing metrics across multiple models / loss functions.
+
+    Args:
+        results_dict  : { 'KL Linear': {'kl_divergence': ..., 'jsd': ..., ...}, ... }
+        metrics_to_show : subset of metric keys to display; defaults to main 5
+        save_path     : output PNG
+
+    WHERE TO CALL (from eval.py):
+        plot_metrics_comparison_bar(
+            {name: res["metrics"] for name, res in all_results.items()}
+        )
+    """
+    if metrics_to_show is None:
+        metrics_to_show = [
+            "kl_divergence", "jsd", "cosine_sim", "pearson_r", "spearman_r"
+        ]
+
+    models = list(results_dict.keys())
+    x      = np.arange(len(metrics_to_show))
+    width  = 0.75 / max(len(models), 1)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for i, model_name in enumerate(models):
+        vals   = [results_dict[model_name].get(m, 0) for m in metrics_to_show]
+        offset = (i - len(models) / 2) * width + width / 2
+        bars   = ax.bar(x + offset, vals, width, label=model_name, alpha=0.85)
+        ax.bar_label(bars, fmt="%.3f", padding=2, fontsize=6.5)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [m.replace("_", "\n") for m in metrics_to_show], fontsize=9
+    )
+    ax.set_ylabel("Score")
+    ax.set_title("Metric Comparison Across Loss Functions")
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Metrics heatmap table  (nice for the report)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_metrics_table(
+    results_dict: dict,
+    save_path: str = "outputs/eval/metrics_table.png",
+) -> None:
+    """
+    Render a colored heatmap table of all models × all metrics.
+
+    WHERE TO CALL:
+        plot_metrics_table({name: res["metrics"] for name, res in all_results.items()})
+    """
+    import matplotlib.colors as mcolors
+
+    metric_order = [
+        "kl_divergence", "jsd", "cosine_sim",
+        "pearson_r", "spearman_r",
+        "precision@100", "precision@200", "precision@500",
+    ]
+    lower_better = {"kl_divergence", "jsd"}
+
+    models  = list(results_dict.keys())
+    headers = metric_order
+
+    data = np.array([
+        [results_dict[m].get(h, np.nan) for h in headers]
+        for m in models
+    ])
+
+    # Normalize each column for color (0=worst, 1=best)
+    norm_data = np.zeros_like(data)
+    for col_i, h in enumerate(headers):
+        col = data[:, col_i]
+        lo, hi = np.nanmin(col), np.nanmax(col)
+        if hi == lo:
+            norm_data[:, col_i] = 0.5
+        else:
+            n = (col - lo) / (hi - lo)
+            norm_data[:, col_i] = (1 - n) if h in lower_better else n
+
+    fig, ax = plt.subplots(figsize=(len(headers) * 1.5, len(models) * 0.7 + 1.2))
+    ax.axis("off")
+    cmap = plt.get_cmap("RdYlGn")
+
+    cell_colors = [[cmap(norm_data[r, c]) for c in range(len(headers))]
+                   for r in range(len(models))]
+    cell_text   = [[f"{data[r, c]:.4f}" for c in range(len(headers))]
+                   for r in range(len(models))]
+
+    table = ax.table(
+        cellText=cell_text,
+        cellColours=cell_colors,
+        rowLabels=models,
+        colLabels=[h.replace("_", "\n") for h in headers],
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.6)
+    ax.set_title("Full Metrics Table (green = better)", fontsize=11, pad=14)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Per-image distribution comparison  (required: Section 5.2 & 6 qualitative)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_distribution_examples(
+    images,
+    true_probs,
+    pred_probs,
+    n_examples: int = 6,
+    save_path: str = "outputs/eval/distribution_examples.png",
+) -> None:
+    """
+    For n_examples//2 low-entropy and n_examples//2 high-entropy images, show:
+      col 0: image
+      col 1: side-by-side bar chart p(y|x) vs q(y|x)
+      col 2: error  q(y|x) − p(y|x)
+
+    Args:
+        images     : torch.Tensor (N, 3, 32, 32) or np.ndarray, un-normalized
+        true_probs : (N, 10)
+        pred_probs : (N, 10)
+        n_examples : total examples (half low, half high)
+        save_path  : output PNG
+
+    WHERE TO CALL:
+        plot_distribution_examples(all_images, true_p, pred_q, n_examples=6)
+    """
+    imgs  = _to_numpy(images)     # (N, 3, 32, 32)
+    p     = _to_numpy(true_probs)
+    q     = _to_numpy(pred_probs)
+    H     = _entropy(p)
+
+    half      = n_examples // 2
+    sorted_ix = np.argsort(H)
+    low_ix    = sorted_ix[:half]
+    high_ix   = sorted_ix[-half:]
+    selected  = list(low_ix) + list(high_ix)
+    labels    = ["Low Entropy"] * half + ["High Entropy"] * half
+
+    fig, axes = plt.subplots(n_examples, 3, figsize=(11, 2.9 * n_examples))
+    fig.suptitle("True (p) vs Predicted (q) Distributions", fontsize=13)
+    x_pos  = np.arange(10)
+    bwidth = 0.36
+
+    for row, (idx, lbl) in enumerate(zip(selected, labels)):
+        img_ax, bar_ax, diff_ax = axes[row]
+
+        # Image
+        img = imgs[idx].transpose(1, 2, 0)           # (H, W, 3)
+        img = (img - img.min()) / (img.max() - img.min() + 1e-9)
+        img_ax.imshow(np.clip(img, 0, 1), interpolation="nearest")
+        img_ax.set_title(f"{lbl}\nH_true = {H[idx]:.2f} bits", fontsize=8)
+        img_ax.axis("off")
+
+        # Bar chart
+        bar_ax.bar(x_pos - bwidth / 2, p[idx], bwidth,
+                   color="#2196F3", alpha=0.85, label="p(y|x) true")
+        bar_ax.bar(x_pos + bwidth / 2, q[idx], bwidth,
+                   color="#FF5722", alpha=0.85, label="q(y|x) pred")
+        bar_ax.set_xticks(x_pos)
+        bar_ax.set_xticklabels(CIFAR10_CLASSES, rotation=45, ha="right", fontsize=7)
+        bar_ax.set_ylim(0, 1.05)
+        bar_ax.set_ylabel("Probability")
+        bar_ax.legend(fontsize=7)
+        bar_ax.set_title("p vs q", fontsize=8)
+
+        # Difference
+        diff = q[idx] - p[idx]
+        cols = ["#4CAF50" if d >= 0 else "#F44336" for d in diff]
+        diff_ax.bar(x_pos, diff, color=cols, alpha=0.85)
+        diff_ax.axhline(0, color="black", linewidth=0.8)
+        diff_ax.set_xticks(x_pos)
+        diff_ax.set_xticklabels(CIFAR10_CLASSES, rotation=45, ha="right", fontsize=7)
+        diff_ax.set_ylabel("q − p")
+        diff_ax.set_title("Prediction Error per Class", fontsize=8)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Precision@K bar chart  (required: Section 6.1 Metric 3)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_precision_at_k(
+    results_dict: dict,
+    ks: list[int] | None = None,
+    save_path: str = "outputs/eval/precision_at_k.png",
+) -> None:
+    """
+    Grouped bar chart of Precision@K for K = 100, 200, 500 across models.
+
+    Args:
+        results_dict : { model_name: {'precision@100': ..., ...}, ... }
+        ks           : list of K values to plot
+
+    WHERE TO CALL:
+        plot_precision_at_k({name: res["metrics"] for name, res in all_results.items()})
+    """
+    if ks is None:
+        ks = [100, 200, 500]
+
+    models = list(results_dict.keys())
+    x      = np.arange(len(ks))
+    width  = 0.7 / max(len(models), 1)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for i, model_name in enumerate(models):
+        vals   = [results_dict[model_name].get(f"precision@{k}", 0) for k in ks]
+        offset = (i - len(models) / 2) * width + width / 2
+        bars   = ax.bar(x + offset, vals, width, label=model_name, alpha=0.85)
+        ax.bar_label(bars, fmt="%.3f", padding=2, fontsize=7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"P@{k}" for k in ks], fontsize=10)
+    ax.set_ylabel("Precision@K")
+    ax.set_ylim(0, 1.15)
+    ax.set_title("Precision@K — Identifying High-Disagreement Images")
+    ax.legend(fontsize=8)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Per-class KL breakdown  (bonus / robustness)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_per_class_kl(
+    per_class_kl_dict: dict,
+    label: str = "",
+    save_path: str = "outputs/eval/per_class_kl.png",
+) -> None:
+    """
+    Horizontal bar chart of per-class KL divergence.
+
+    Args:
+        per_class_kl_dict : { 'cat': 0.32, 'dog': 0.28, ... }
+                             as returned by evaluation.robustness.per_class_kl()
+
+    WHERE TO CALL:
+        from evaluation.robustness import per_class_kl
+        pkl = per_class_kl(true_p, pred_q, hard_labels)
+        plot_per_class_kl(pkl, label="KL Linear")
+    """
+    classes = list(per_class_kl_dict.keys())
+    values  = list(per_class_kl_dict.values())
+    sorted_pairs = sorted(zip(values, classes), reverse=True)
+    values, classes = zip(*sorted_pairs)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colors = plt.cm.RdYlGn_r(np.linspace(0.15, 0.85, len(classes)))
+    bars   = ax.barh(classes, values, color=colors, edgecolor="white")
+    ax.bar_label(bars, fmt="%.4f", padding=3, fontsize=8)
+    ax.set_xlabel("Mean KL Divergence ↓")
+    ax.set_title(f"Per-Class KL Divergence{f'  ({label})' if label else ''}")
+    ax.grid(axis="x", alpha=0.3)
+    ax.invert_yaxis()
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  Robustness curves  (OOD noise / annotator subsampling)
+# ─────────────────────────────────────────────────────────────────────────────
+def plot_robustness_curves(
+    ood_results: dict | None = None,
+    subsampling_results: dict | None = None,
+    save_path: str = "outputs/eval/robustness.png",
+) -> None:
+    """
+    Plot OOD noise robustness and/or annotator subsampling robustness.
+
+    Args:
+        ood_results         : { 'sigma=0.05': mean_entropy, ... }
+                              from evaluation.robustness.ood_corruption_check()
+        subsampling_results : { 'k=5': pearson_r, ... }
+                              from evaluation.robustness.annotator_subsampling_check()
+
+    WHERE TO CALL:
+        ood = ood_corruption_check(model, test_images)
+        sub = annotator_subsampling_check(raw_counts, pred_q)
+        plot_robustness_curves(ood_results=ood, subsampling_results=sub)
+    """
+    n_plots = sum([ood_results is not None, subsampling_results is not None])
+    if n_plots == 0:
+        print("[eval_plots] plot_robustness_curves: nothing to plot.")
+        return
+
+    fig, axes = plt.subplots(1, n_plots, figsize=(6 * n_plots, 4.5))
+    if n_plots == 1:
+        axes = [axes]
+
+    ax_idx = 0
+    if ood_results is not None:
+        labels = list(ood_results.keys())
+        values = list(ood_results.values())
+        sigmas = [float(k.split("=")[1]) for k in labels]
+        axes[ax_idx].plot(sigmas, values, marker="o", color="#E91E63", linewidth=2)
+        axes[ax_idx].set_xlabel("Gaussian noise σ")
+        axes[ax_idx].set_ylabel("Mean Predicted Entropy (bits)")
+        axes[ax_idx].set_title("OOD Robustness: Predicted Entropy under Noise")
+        axes[ax_idx].grid(alpha=0.3)
+        ax_idx += 1
+
+    if subsampling_results is not None:
+        ks     = [int(k.split("=")[1]) for k in subsampling_results]
+        rs     = list(subsampling_results.values())
+        axes[ax_idx].plot(ks, rs, marker="s", color="#9C27B0", linewidth=2)
+        axes[ax_idx].set_xlabel("Number of Annotators (k)")
+        axes[ax_idx].set_ylabel("Pearson r  (entropy)")
+        axes[ax_idx].set_title("Robustness to Annotator Subsampling")
+        axes[ax_idx].grid(alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[eval_plots] Saved → {save_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quick self-test with dummy data
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import torch
+
+    torch.manual_seed(42)
+    N  = 200
+    p  = torch.softmax(torch.randn(N, 10), dim=1)
+    q  = torch.softmax(torch.randn(N, 10), dim=1)
+
+    # Fake images: (N, 3, 32, 32) uniform noise
+    imgs = torch.rand(N, 3, 32, 32)
+
+    dummy_metrics = {
+        "kl_divergence":  0.42, "jsd": 0.19, "cosine_sim": 0.71,
+        "pearson_r": 0.61, "spearman_r": 0.59,
+        "precision@100": 0.55, "precision@200": 0.52, "precision@500": 0.48,
+    }
+    results = {"KL Linear": dummy_metrics,
+               "JSD MLP": {**dummy_metrics, "kl_divergence": 0.38, "jsd": 0.16,
+                            "cosine_sim": 0.75, "pearson_r": 0.65}}
+
+    os.makedirs("outputs/eval", exist_ok=True)
+    plot_entropy_scatter(p, q, label="Dummy", save_path="outputs/eval/test_scatter.png")
+    plot_metrics_comparison_bar(results,         save_path="outputs/eval/test_bar.png")
+    plot_metrics_table(results,                  save_path="outputs/eval/test_table.png")
+    plot_distribution_examples(imgs, p, q,
+                                n_examples=4,   save_path="outputs/eval/test_dist.png")
+    plot_precision_at_k(results,                save_path="outputs/eval/test_pak.png")
+    plot_per_class_kl({"cat": 0.32, "dog": 0.28, "bird": 0.45,
+                        "airplane": 0.12, "ship": 0.15, "automobile": 0.18,
+                        "deer": 0.22, "frog": 0.30, "horse": 0.25, "truck": 0.20},
+                      label="Dummy",            save_path="outputs/eval/test_pkl.png")
+    plot_robustness_curves(
+        ood_results={"sigma=0.05": 0.31, "sigma=0.1": 0.45,
+                     "sigma=0.2": 0.71, "sigma=0.3": 0.95, "sigma=0.5": 1.40},
+        subsampling_results={"k=5": 0.48, "k=10": 0.61, "k=20": 0.73},
+        save_path="outputs/eval/test_robust.png",
+    )
+    print("Self-test complete — check outputs/eval/")
 
 ===== ./losses/custom_losses.py =====
 import torch
@@ -1351,11 +2684,13 @@ weight_decay = 1e-4
 loss_beta = 0.5
 loss_epsilon = 0.1
 
+INIT_TEMP = 2.0
+
 all_configs = []
 for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, use_temperature):
     exp_name = f'{loss}_{head}_pt_{pt}'
     if temp:
-        exp_name += '_temp'
+        exp_name += f'_temp{INIT_TEMP}'
     save_dir = PROJECT_ROOT / 'outputs' / 'checkpoints' / exp_name
     cmd = (
         f"python -m training.train "
@@ -1371,7 +2706,7 @@ for loss, head, pt, temp in itertools.product(losses, heads, pretrained_types, u
         f"--loss_epsilon {loss_epsilon} "
     )
     if temp:
-        cmd += " --use_temperature --init_temp 2.0"
+        cmd += f" --use_temperature --init_temp {INIT_TEMP}"
     all_configs.append((exp_name, cmd, save_dir))
 
 
@@ -1680,7 +3015,6 @@ def main():
     train_loader = loaders['train']
     val_loader = loaders['val']
 
-    # Model (NO torch.compile – it breaks with learnable temperature)
     model = build_soft_label_model(
         head_type=args.head,
         pretrained_type=args.pretrained_type,
@@ -1688,6 +3022,7 @@ def main():
         init_temp=args.init_temp
     )
     model = model.to(device)
+    model = torch.compile(model, mode='reduce-overhead')
 
     # Loss
     loss_fn = get_loss_function(args.loss, beta=args.loss_beta, epsilon=args.loss_epsilon)
@@ -2428,72 +3763,167 @@ plotting code, but clearly got tired and stuffed it into `evaluation/` instead.
   an abandoned construction site.
 
 ===== ./explainability/__init__.py =====
+from explainability.grad_cam import GradCAM, run_grad_cam_analysis
 
 ===== ./explainability/grad_cam.py =====
+"""
+explainability/grad_cam.py
+============================
+Full Grad-CAM implementation for the soft-label disagreement model.
+
+This file IS your explainability tab deliverable.
+It imports GradCAM from visualisations/grad_cam_plots.py (DRY principle)
+and adds the standalone run_grad_cam_analysis() entry-point that produces
+all Grad-CAM output figures in one call.
+
+USAGE (standalone):
+    python explainability/grad_cam.py  --checkpoint outputs/checkpoints/kl_linear/best.pth
+                                       --head linear
+                                       --n_low 4 --n_high 4
+
+USAGE (imported):
+    from explainability.grad_cam import GradCAM, run_grad_cam_analysis
+    gc = GradCAM(model, model.layer4[-1])
+    run_grad_cam_analysis(gc, model, test_loader)
+"""
+
+# ── Re-export GradCAM so the rest of the codebase can do
+#    `from explainability.grad_cam import GradCAM`
+from visualisations.grad_cam_plots import (
+    GradCAM,
+    plot_grad_cam_grid,
+    plot_entropy_vs_gradcam,
+    overlay_grad_cam,
+)
+
+__all__ = [
+    "GradCAM",
+    "plot_grad_cam_grid",
+    "plot_entropy_vs_gradcam",
+    "overlay_grad_cam",
+    "run_grad_cam_analysis",
+]
+
+import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import cv2
+import argparse
 
-class GradCAM:
-    def __init__(self, model: nn.Module, target_layer: nn.Module):
-        self.model = model
-        self.target_layer = target_layer
-        self._gradients = None
-        self._activations = None
-        self._register_hooks()
 
-    def _register_hooks(self):
-        def forward_hook(module, input, output):
-            self._activations = output.detach()
-        def backward_hook(module, grad_in, grad_out):
-            self._gradients = grad_out[0].detach()
-        self.target_layer.register_forward_hook(forward_hook)
-        self.target_layer.register_full_backward_hook(backward_hook)
+def run_grad_cam_analysis(
+    grad_cam: GradCAM,
+    model: torch.nn.Module,
+    test_loader,
+    n_low: int = 4,
+    n_high: int = 4,
+    strategy: str = "top_pred",
+    output_dir: str = "outputs/explainability",
+    max_batches: int = 4,           # limit how many batches to load (saves time)
+) -> None:
+    """
+    Full Grad-CAM analysis:
+      1. Collects test images + predictions (up to max_batches × batch_size)
+      2. Generates  outputs/explainability/grad_cam_grid.png
+      3. Generates  outputs/explainability/entropy_vs_gradcam.png
 
-    def generate(self, image: torch.Tensor, target_class=None, strategy="top_pred"):
-        self.model.eval()
-        image = image.requires_grad_(True)
-        logits = self.model(image)
-        probs = F.softmax(logits, dim=1)
+    Args:
+        grad_cam    : GradCAM instance already hooked to a model layer
+        model       : the eval-mode model
+        test_loader : DataLoader (images, soft_labels, hard_labels)
+        n_low       : number of low-entropy examples
+        n_high      : number of high-entropy examples
+        strategy    : "top_pred" | "top_true" | "entropy_weighted"
+        output_dir  : directory for output PNGs
+        max_batches : cap on batches to process (keep GPU memory safe)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    device = next(model.parameters()).device
 
-        if target_class is not None:
-            score = probs[0, target_class]
-        elif strategy == "top_pred":
-            score = probs.max(dim=1)[0]  # just a scalar
-        elif strategy == "entropy_weighted":
-            eps = 1e-12
-            weights = -(probs * torch.log(probs + eps))
-            score = (weights * probs).sum()
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
+    all_imgs, all_true, all_pred = [], [], []
+    model.eval()
+    with torch.no_grad():
+        for batch_i, (imgs, soft_labels, _) in enumerate(test_loader):
+            if batch_i >= max_batches:
+                break
+            imgs        = imgs.to(device)
+            soft_labels = soft_labels.to(device)
+            preds       = model(imgs)
+            all_imgs.append(imgs.cpu())
+            all_true.append(soft_labels.cpu())
+            all_pred.append(preds.cpu())
 
-        self.model.zero_grad()
-        score.backward()
-        cam = self._compute_cam()
-        return cam
+    images    = torch.cat(all_imgs,  dim=0)
+    true_probs = torch.cat(all_true, dim=0)
+    pred_probs = torch.cat(all_pred, dim=0)
 
-    def _compute_cam(self):
-        grads = self._gradients[0]  # (C, H, W)
-        acts  = self._activations[0] # (C, H, W)
-        weights = grads.mean(dim=(1,2))
-        cam = (weights[:, None, None] * acts).sum(dim=0)
-        cam = F.relu(cam)
-        cam = cam.cpu().numpy()
-        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-        return cam
+    print(f"[grad_cam] Collected {len(images)} images for analysis.")
 
-    @staticmethod
-    def overlay(raw_image: np.ndarray, cam: np.ndarray, alpha=0.45):
-        h, w = raw_image.shape[:2]
-        cam_resized = cv2.resize(cam, (w, h), interpolation=cv2.INTER_LINEAR)
-        heatmap = cv2.applyColorMap((cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
-        img_float = raw_image.astype(np.float32)
-        if img_float.max() > 1.0:
-            img_float /= 255.0
-        return np.clip((1 - alpha) * img_float + alpha * heatmap, 0, 1)
+    plot_grad_cam_grid(
+        grad_cam, images, true_probs, pred_probs,
+        n_low=n_low, n_high=n_high, strategy=strategy,
+        save_path=os.path.join(output_dir, "grad_cam_grid.png"),
+    )
+
+    plot_entropy_vs_gradcam(
+        grad_cam, images, true_probs, pred_probs,
+        strategy="entropy_weighted",
+        n_per_group=min(4, n_low, n_high),
+        save_path=os.path.join(output_dir, "entropy_vs_gradcam.png"),
+    )
+
+    print(f"[grad_cam] All outputs saved to {output_dir}/")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI entry-point
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run Grad-CAM analysis")
+    parser.add_argument("--checkpoint", required=True, help="Path to .pth checkpoint")
+    parser.add_argument("--head",       default="linear", choices=["linear", "mlp"])
+    parser.add_argument("--n_low",      type=int, default=4)
+    parser.add_argument("--n_high",     type=int, default=4)
+    parser.add_argument("--strategy",   default="top_pred",
+                        choices=["top_pred", "top_true", "entropy_weighted"])
+    parser.add_argument("--output_dir", default="outputs/explainability")
+    parser.add_argument("--max_batches",type=int, default=4)
+    args = parser.parse_args()
+
+    # ── Lazy imports (avoid loading torch until needed)
+    import sys
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+    from models.cifar_resnet import build_soft_label_model
+    from data.pipeline import load_full_dataset, create_splits, create_dataloaders
+    from utils.device import get_device
+
+    device = get_device()
+
+    # Load model
+    model = build_soft_label_model(head_type=args.head, pretrained=False)
+    ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
+    model.load_state_dict(state)
+    model.to(device).eval()
+    print(f"Loaded checkpoint: {args.checkpoint}  (epoch {ckpt.get('epoch','?')})")
+
+    # Target layer: last residual block of ResNet-18
+    target_layer = model.layer4[-1]
+    gc = GradCAM(model, target_layer)
+
+    # Data
+    dataset     = load_full_dataset()
+    splits      = create_splits(dataset)
+    loaders     = create_dataloaders(splits)
+    test_loader = loaders["test"]
+
+    run_grad_cam_analysis(
+        gc, model, test_loader,
+        n_low=args.n_low, n_high=args.n_high,
+        strategy=args.strategy,
+        output_dir=args.output_dir,
+        max_batches=args.max_batches,
+    )
+
 ===== ./README.md =====
 # Predicting Human Annotator Disagreement on CIFAR-10
 

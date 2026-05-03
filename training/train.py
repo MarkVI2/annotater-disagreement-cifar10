@@ -171,7 +171,8 @@ def main():
     # Generate training curves after training
     try:
         from visualisations.training_curves import plot_training_curves
-        plot_training_curves(LOGS_DIR, exp_name)
+        csv_path = os.path.join(LOGS_DIR, f"{exp_name}_metrics.csv")
+        plot_training_curves(csv_path, label=exp_name)
     except Exception as e:
         print(f"Could not generate training curve plot: {e}")
 
