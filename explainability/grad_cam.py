@@ -141,7 +141,7 @@ if __name__ == "__main__":
     print(f"Loaded checkpoint: {args.checkpoint}  (epoch {ckpt.get('epoch','?')})")
 
     # Target layer: last residual block of ResNet-18
-    target_layer = model.layer4[-1]
+    target_layer = model.backbone.layer4[-1]
     gc = GradCAM(model, target_layer)
 
     # Data
