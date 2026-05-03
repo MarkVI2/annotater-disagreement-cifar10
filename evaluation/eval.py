@@ -176,8 +176,8 @@ def main():
     # OOD corruption check and plot
     print("Running OOD corruption check on best model...")
     best_model = load_model_from_ckpt(best_ckpts[best_model_name], device,
-                                      head="mlp" if "mlp" in best_model_name else "linear",
-                                      use_temperature="_temp" in best_model_name)
+                                  head_type="mlp" if "mlp" in best_model_name else "linear",
+                                  use_temperature="_temp" in best_model_name)
     ood_results = ood_corruption_check(best_model, images_best, severities=[0.05, 0.1, 0.2, 0.3, 0.5])
     plot_robustness_curves_eval(ood_results=ood_results,
                                 save_path="outputs/eval/aggregated/robustness_ood.png")
