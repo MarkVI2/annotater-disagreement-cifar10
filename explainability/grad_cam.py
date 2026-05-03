@@ -21,6 +21,8 @@ USAGE (imported):
 
 # ── Re-export GradCAM so the rest of the codebase can do
 #    `from explainability.grad_cam import GradCAM`
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from visualisations.grad_cam_plots import (
     GradCAM,
     plot_grad_cam_grid,
