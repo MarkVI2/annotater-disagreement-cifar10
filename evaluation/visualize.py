@@ -58,11 +58,10 @@ def plot_metrics_comparison(results_dict: dict, save_path="outputs/metrics_compa
     print(f"  Saved: {save_path}")
 
 
-def plot_qualitative_examples(images: torch.Tensor, true_dists: torch.Tensor,
-                               pred_dists: torch.Tensor, entropies: torch.Tensor,
-                               save_path="outputs/qualitative_grid.png"):
+def plot_qualitative_examples(images, true_dists, pred_dists, entropies, save_path="outputs/qualitative_grid.png"):
     """3x3 grid: cols = low/medium/high entropy, rows = image + true dist + pred dist."""
-    sorted_idx = torch.argsort(entropies)
+    import torch as _torch
+    sorted_idx = _torch.argsort(entropies)
     n = len(sorted_idx)
     low_idx    = sorted_idx[:3]
     medium_idx = sorted_idx[n//2 - 1 : n//2 + 2]
@@ -76,11 +75,21 @@ def plot_qualitative_examples(images: torch.Tensor, true_dists: torch.Tensor,
     for col, (idx_group, col_title) in enumerate(zip(groups, col_titles)):
         for row, idx in enumerate(idx_group):
             ax = fig.add_subplot(outer[row, col])
-            # Show image if available, else placeholder
             if images is not None:
-                img = images[idx].permute(1, 2, 0).numpy()
-                img = (img - img.min()) / (img.max() - img.min() + 1e-9)
-                ax.imshow(img)
+                img = images[idx]
+                # Handle tensor vs numpy, and ensure (H, W, C) for imshow
+                if hasattr(img, 'permute'):
+                    img_np = img.permute(1, 2, 0).cpu().numpy()
+                elif isinstance(img, np.ndarray):
+                    if img.shape[0] == 3:  # (3, H, W) -> (H, W, 3)
+                        img_np = img.transpose(1, 2, 0)
+                    else:
+                        img_np = img
+                else:
+                    img_np = img
+                # Normalize if needed
+                img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-9)
+                ax.imshow(img_np.clip(0,1))
             else:
                 ax.text(0.5, 0.5, f'img {idx.item()}', ha='center', va='center')
             H_val = entropies[idx].item()

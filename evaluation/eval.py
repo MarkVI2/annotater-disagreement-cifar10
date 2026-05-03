@@ -91,8 +91,8 @@ def run_analysis_for_model(model, test_loader, device, output_dir='outputs/eval'
 
     # Per-model plots
     plot_entropy_scatter(true_p, pred_q, save_path=os.path.join(output_dir, "entropy_scatter.png"))
-    plot_qualitative_examples(raw_images.permute(0,3,1,2)[:1000], true_p[:1000], pred_q[:1000],
-                              compute_entropy(true_p[:1000]), save_path=os.path.join(output_dir, "qualitative_grid.png"))
+    plot_qualitative_examples(images_raw[:1000], true_p[:1000], pred_q[:1000],
+                          compute_entropy(true_p[:1000]), save_path=os.path.join(output_dir, "qualitative_grid.png"))
     plot_failure_cases(images_raw, true_p.numpy(), pred_q.numpy(), save_path=os.path.join(output_dir, "failure_cases.png"))
     plot_entropy_analysis(true_p.numpy(), pred_q.numpy(), save_path=os.path.join(output_dir, "entropy_analysis.png"))
     plot_distribution_comparison(images_raw[:1000], true_p.numpy()[:1000], pred_q.numpy()[:1000],
