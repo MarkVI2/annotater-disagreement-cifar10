@@ -133,7 +133,7 @@ if __name__ == "__main__":
     device = get_device()
 
     # Load model
-    model = build_soft_label_model(head_type=args.head, pretrained=False)
+    model = build_soft_label_model(head_type=args.head, pretrained_type='random')
     ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=True)
     state = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
     model.load_state_dict(state)
