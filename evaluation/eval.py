@@ -162,12 +162,11 @@ def main():
     # For completeness, load counts file if available:
     counts_path = "data/cifar10h-counts.npy"
     if os.path.exists(counts_path):
-        raw_counts = np.load(counts_path)
-        # We need to align counts with test split indices. For now, just use the whole test set.
-        # The test set in CIFAR10H is the last 2000 images of the 10000 set.
-        # Our test split is a subset of those 2000. It's simpler to use the full test set.
-        # We'll skip for brevity; you can add proper indexing.
-        print("Annotator subsampling check available (counts file found). Running...")
+        raw_counts_full = np.load(counts_path)
+        # Select only the test split indices (we have test_indices from splits)
+        test_indices = splits['test'].indices   # list of indices in the full dataset
+        raw_counts = raw_counts_full[test_indices]   # shape (2000, 10)
+        print("Annotator subsampling check running...")
         sub_results = annotator_subsampling_check(raw_counts, pred_q_best)
         plot_robustness_curves_eval(subsampling_results=sub_results,
                                     save_path="outputs/eval/aggregated/robustness_subsampling.png")
