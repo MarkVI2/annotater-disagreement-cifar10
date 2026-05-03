@@ -339,12 +339,8 @@ def plot_gradcam_grid(
     Shows Grad-CAM for:
       - n_each lowest-disagreement images  (low H_true)
       - n_each highest-disagreement images (high H_true)
- 
+
     Each row: [original image] [top-class CAM] [entropy-weighted CAM]
- 
-    WHERE TO CALL:
-      After loading your best checkpoint, call this once on the test set.
-      Pass the same test_loader images you used for evaluation.
     """
     H_true  = compute_shannon_entropy(true_probs)
     sorted_idx = np.argsort(H_true)
@@ -352,25 +348,29 @@ def plot_gradcam_grid(
     high_idx   = sorted_idx[-n_each:]
     selected   = list(low_idx) + list(high_idx)
     labels     = (["Low Disagree"] * n_each) + (["High Disagree"] * n_each)
- 
+
     grad_cam = GradCAM(model, target_layer)
     n_total  = len(selected)
     fig, axes = plt.subplots(n_total, 3, figsize=(9, 2.5 * n_total))
     fig.suptitle("Grad-CAM: Low vs High Disagreement Images", fontsize=12)
- 
+
+    # Move normalized images to the model's device once
+    device = next(model.parameters()).device
+    images_norm = images_norm.to(device)
+
     for row, (idx, label) in enumerate(zip(selected, labels)):
         img_tensor = images_norm[idx].unsqueeze(0)   # (1,3,32,32)
         raw_img    = images_raw[idx]                  # (32,32,3)
- 
+
         cam_top     = grad_cam.generate(img_tensor, strategy="top_pred")
         cam_entropy = grad_cam.generate(img_tensor, strategy="entropy_weighted")
- 
+
         overlay_top     = GradCAM.overlay(raw_img, cam_top)
         overlay_entropy = GradCAM.overlay(raw_img, cam_entropy)
- 
+
         top_cls  = pred_probs[idx].argmax()
         true_cls = true_probs[idx].argmax()
- 
+
         axes[row, 0].imshow(np.clip(raw_img, 0, 1))
         axes[row, 0].set_title(
             f"{label} | H={H_true[idx]:.2f}\n"
@@ -378,15 +378,15 @@ def plot_gradcam_grid(
             fontsize=7
         )
         axes[row, 0].axis("off")
- 
+
         axes[row, 1].imshow(overlay_top)
         axes[row, 1].set_title(f"CAM: top class\n({CIFAR10_CLASSES[top_cls]})", fontsize=7)
         axes[row, 1].axis("off")
- 
+
         axes[row, 2].imshow(overlay_entropy)
         axes[row, 2].set_title("CAM: entropy-weighted", fontsize=7)
         axes[row, 2].axis("off")
- 
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
