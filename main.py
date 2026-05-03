@@ -46,15 +46,15 @@ def run_evaluation():
 
 def run_post_evaluation():
     """
-    STAGE 4: Post‑evaluation visualisations and explainability.
+    STAGE 4: Post-evaluation visualisations and explainability.
     Produces:
       - Architecture diagram + parameter table (visualisations/model_diagram.py)
       - Overlay of all training curves (visualisations/training_curves.py)
-      - Grad‑CAM analysis (explainability/grad_cam.py CLI)
-      - Composite high‑entropy disagreement images (manual_disagreement.py)
+      - Grad-CAM analysis (explainability/grad_cam.py CLI)
+      - Composite high-entropy disagreement images (manual_disagreement.py)
     """
     print("\n" + "="*60)
-    print("STAGE 4: POST‑EVALUATION VISUALISATIONS")
+    print("STAGE 4: POST-EVALUATION VISUALISATIONS")
     print("="*60)
 
     # 4.1 Architecture diagram & parameter table
@@ -69,7 +69,7 @@ def run_post_evaluation():
     # (the training script already does this per experiment)
 
     # 4.3 Grad‑CAM analysis (using the best model)
-    print("\n--- Grad‑CAM analysis ---")
+    print("\n--- Grad-CAM analysis ---")
     best_ckpt = find_best_checkpoint()  # helper to pick the checkpoint with lowest validation loss
     if best_ckpt:
         # Determine head type and temp from the checkpoint path
@@ -85,7 +85,7 @@ def run_post_evaluation():
         )
 
     # 4.4 Manual disagreement composite images (30 highest entropy images)
-    print("\n--- Composite high‑entropy images ---")
+    print("\n--- Composite high-entropy images ---")
     subprocess.run([sys.executable, "analysis/manual_disagreement.py"], check=False)
 
     print("\n===== ALL STAGES COMPLETE =====")
@@ -118,11 +118,11 @@ def find_best_checkpoint():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Full pipeline for CIFAR‑10H disagreement project")
+    parser = argparse.ArgumentParser(description="Full pipeline for CIFAR-10H disagreement project")
     parser.add_argument("--skip-data", action="store_true", help="Skip data pipeline")
     parser.add_argument("--skip-train", action="store_true", help="Skip training")
     parser.add_argument("--skip-eval", action="store_true", help="Skip evaluation")
-    parser.add_argument("--skip-post", action="store_true", help="Skip post‑evaluation visualisations")
+    parser.add_argument("--skip-post", action="store_true", help="Skip post-evaluation visualisations")
     args = parser.parse_args()
 
     if not args.skip_data:
