@@ -9,3 +9,4 @@ tqdm
 pyyaml
 tensorboard
 Pillow
+opencv-python
