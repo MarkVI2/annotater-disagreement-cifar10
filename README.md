@@ -6,7 +6,11 @@ Chirag Goyal, Mayak M. Thakre, Dhruva Mekala SE23UCSE{223, 184, 050, 218, 219}
 Complete code and results:
 [GitHub](https://github.com/MarkVI2/annotater-disagreement-cifar10)
 
----
+Project report can be found at
+[docs/G_223_184_050_218_219.pdf](docs/G_223_184_050_218_219.pdf)
+
+Overview of the codebase (file based documentation) can be found at
+[docs/overview.md](docs/overview.md)
 
 ## Overview
 
